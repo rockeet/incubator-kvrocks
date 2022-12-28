@@ -175,6 +175,7 @@
         "max_bytes_for_level_base": "256M",
         "max_bytes_for_level_multiplier": 1,
         "target_file_size_base": "32M", "target_file_size_multiplier": 2,
+        "memtable_factory": "${dyna}",
         "table_factory": "${dispatch}",
         "compression_per_level": [
           "kNoCompression", "kNoCompression", "kNoCompression",
@@ -198,6 +199,7 @@
         "max_bytes_for_level_base": "256M",
         "max_bytes_for_level_multiplier": 1,
         "target_file_size_base": "32M", "target_file_size_multiplier": 2,
+        "memtable_factory": "${dyna}",
         "table_factory": "${dispatch}",
         "compression_per_level": [
           "kNoCompression", "kNoCompression", "kNoCompression",
@@ -219,6 +221,7 @@
         "max_bytes_for_level_base": "256M",
         "max_bytes_for_level_multiplier": 1,
         "target_file_size_base": "16M", "target_file_size_multiplier": 2,
+        "memtable_factory": "${dyna}",
         "table_factory": "${dispatch}",
         "compression_per_level": [
           "kNoCompression", "kNoCompression", "kNoCompression",
@@ -240,6 +243,7 @@
         "max_bytes_for_level_base": "256M",
         "max_bytes_for_level_multiplier": 1,
         "target_file_size_base": "16M", "target_file_size_multiplier": 2,
+        "memtable_factory": "${dyna}",
         "table_factory": "${dispatch}",
         "compression_per_level": [
           "kNoCompression", "kNoCompression", "kNoCompression",
@@ -261,6 +265,7 @@
         "max_bytes_for_level_base": "256M",
         "max_bytes_for_level_multiplier": 1,
         "target_file_size_base": "8M", "target_file_size_multiplier": 2,
+        "memtable_factory": "${dyna}",
         "table_factory": "${dispatch}",
         "compression_per_level": [
           "kNoCompression", "kNoCompression", "kNoCompression",
