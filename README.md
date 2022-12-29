@@ -16,6 +16,53 @@
  specific language governing permissions and limitations
  under the License.
 -->
+# ToplingDB support for kvrocks
+[ToplingDB](https://github.com/topling/toplingdb) is compatible with RocksDB and provide higher performance, [WebView](https://github.com/topling/rockside/wiki/WebView), native support to prometheus, secondary instance on shared storage ...
+
+ToplingDB distributed compaction can not be supported since kvrocks CompactionFilter need to access DB and calling DB::Get.
+
+## 1. Build with ToplingDB
+By default ToplingDB is not enabled, to compile kvrocks with ToplingDB, following instructions below:
+
+## 1.1 Build ToplingDB
+```bash
+git clone https://github.com/topling/toplingdb
+cd toplingdb
+make -j`nproc` DEBUG_LEVEL=0 INSTALL_LIBDIR=/path/to/toplingdb/lib install
+```
+
+## 1.2 Build kvrocks with ToplingDB
+```bash
+# build with ToplingDB, you should build and install ToplingDB first
+env TOPLINGDB_HOME=/path/to/toplingdb-repo TOPLINGDB_LIBDIR=/path/to/toplingdb/lib \
+    ./x.py build -j`nproc` -DCMAKE_BUILD_TYPE=Release
+
+# copy html files to kvrocks's ToplingDB document root, this makes webview pretty
+cp /path/to/toplingdb-repo/sideplugin/rockside/src/topling/web/{index.html,style.css} \
+   /path/to/kvrocks/toplingdb/document-root
+```
+
+## 2. Run with ToplingDB
+env var `TOPLING_CONF` specifies ToplingDB json/yaml config which instructs kvrocks to run with ToplingDB.
+
+If env var `TOPLING_CONF` is not specified, kvrocks will run without ToplingDB sideplugin and WebView...
+
+User should change datadir in json config.
+
+```bash
+$ env TOPLING_CONF=kvtopling-community.json ./build/kvrocks -c kvrocks.conf
+```
+
+## 3. Run with ToplingDB shared storage secondary instance
+Secondary instance on shared storage sharing same files of primary instance and keep catch up with primary.
+
+```bash
+$ env TOPLING_CONF=kvtopling-community-2nd.json ./build/kvrocks -c kvrocks.conf
+```
+
+---
+---
+---
 
 <img src="https://kvrocks.apache.org/img/kvrocks-featured.png" alt="kvrocks_logo" width="350"/>
 
