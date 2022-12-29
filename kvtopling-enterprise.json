@@ -1,6 +1,6 @@
 {
     "http": {
-      "document_root": "/nvme-shared/kvrocks/kvrocks_2nd",
+      "document_root": "/nvme-shared/kvrocks/kvrocks_data",
       "hide_files_patterns": "*.sst|*.dbtmp",
       "num_threads": "50",
       "listening_ports": "2011"
@@ -99,16 +99,32 @@
         "class": "SingleFastTable",
         "params": {}
       },
+      "dzip": {
+        "class": "ToplingZipTable",
+        "params": {
+          "localTempDir": "/tmp",
+          "acceptCompressionRatio": 0.8,
+          "enableStatistics": false,
+          "warmupLevel": "kIndex",
+          "optimizeCpuL3Cache": true,
+          "offsetArrayBlockUnits": 128,
+          "sampleRatio": 0.01,
+          "checksumLevel": 0,
+          "debugLevel": 0,
+          "minDictZipValueSize": "30",
+          "minPreadLen": 64
+        }
+      },
       "dispatch": {
-        "comment": "used for per-level stat show in webview",
         "class": "DispatcherTable",
         "params": {
           "default": "bb",
           "readers": {
             "BlockBasedTable": "bb",
+            "ToplingZipTable": "dzip",
             "SingleFastTable": "sng"
           },
-          "level_writers": ["sng", "sng", "bb", "bb", "bb"]
+          "level_writers": ["sng", "sng", "bb", "bb", "bb", "bb", "dzip"]
         }
       }
     },
@@ -287,7 +303,6 @@
         "max_bytes_for_level_base": "256M",
         "max_bytes_for_level_multiplier": 1,
         "target_file_size_base": "64M", "target_file_size_multiplier": 2,
-        "memtable_factory": "${dyna}",
         "table_factory": "${dispatch}",
         "compression_per_level": [
           "kNoCompression", "kNoCompression", "kNoCompression",
@@ -328,7 +343,7 @@
     },
     "databases": {
       "kvrocks_data": {
-        "method": "DB::OpenAsSecondary",
+        "method": "DB::Open",
         "params": {
           "db_options": "${dbopt}",
           "column_families": {
@@ -339,8 +354,6 @@
             "propagate": "${propagate}",
             "stream": "${stream}"
           },
-          "auto_catch_up_delay_ms": 100,
-          "secondary_path": "/nvme-shared/kvrocks/kvrocks_2nd",
           "path": "/nvme-shared/kvrocks/kvrocks_data",
           "comment": "last part of 'path' is 'kvrocks_data', this must be the same with database name"
         }

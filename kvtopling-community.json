@@ -338,7 +338,8 @@
             "propagate": "${propagate}",
             "stream": "${stream}"
           },
-          "path": "/nvme-shared/kvrocks/kvrocks_data"
+          "path": "/nvme-shared/kvrocks/kvrocks_data",
+          "comment": "last part of 'path' is 'kvrocks_data', this must be the same with database name"
         }
       }
     },

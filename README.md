@@ -53,12 +53,23 @@ User should change datadir in json config.
 $ env TOPLING_CONF=kvtopling-community.json ./build/kvrocks -c kvrocks.conf
 ```
 
+When run with ToplingDB, RocksDB options(rocksdb.*) in `kvrocks.conf` are ignored.
+
 ## 3. Run with ToplingDB shared storage secondary instance
 Secondary instance on shared storage sharing same files of primary instance and keep catch up with primary.
 
 ```bash
 $ env TOPLING_CONF=kvtopling-community-2nd.json ./build/kvrocks -c kvrocks.conf
 ```
+
+## 4. ToplingDB config files
+
+Primary Node | Secondary Node | ToplingZipTable
+-------------|-------|------
+[kvtopling-community.json](kvtopling-community.json)|[kvtopling-community-2nd.json](kvtopling-community-2nd.json)| No
+[kvtopling-enterprise.json](kvtopling-enterprise.json)|[kvtopling-enterprise-2nd.json](kvtopling-enterprise-2nd.json)|Yes
+
+Databases created by community version can be smoothly upgraded to enterprise version.
 
 ---
 ---
