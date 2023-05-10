@@ -40,6 +40,10 @@
 #include "observer_or_unique.h"
 #include "status.h"
 
+#ifdef KVROCKS_USE_TOPLINGDB
+#include <topling/side_plugin_repo.h>
+#endif
+
 const int kReplIdLength = 16;
 
 enum ColumnFamilyID {
@@ -72,6 +76,12 @@ class Storage {
   void SetWriteOptions(const Config::RocksDB::WriteOptions &config);
   void SetReadOptions(rocksdb::ReadOptions &read_options);
   Status Open(bool read_only = false);
+
+ private:
+  Status OpenRocks(bool read_only = false);
+  Status OpenTopling(const char *conf);
+
+ public:
   void CloseDB();
   void EmptyDB();
   rocksdb::BlockBasedTableOptions InitTableOptions();
@@ -211,6 +221,9 @@ class Storage {
   rocksdb::WriteOptions write_opts_ = rocksdb::WriteOptions();
 
   rocksdb::Status writeToDB(const rocksdb::WriteOptions &options, rocksdb::WriteBatch *updates);
+#ifdef KVROCKS_USE_TOPLINGDB
+  rocksdb::SidePluginRepo repo_;
+#endif
 };
 
 }  // namespace engine

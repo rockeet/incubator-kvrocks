@@ -27,6 +27,9 @@
 
 #include "time_util.h"
 #include "types/redis_bitmap.h"
+#ifdef KVROCKS_USE_TOPLINGDB
+#include <topling/side_plugin_factory.h>
+#endif
 
 namespace engine {
 
@@ -138,4 +141,14 @@ bool SubKeyFilter::Filter(int level, const Slice &key, const Slice &value, std::
   return IsMetadataExpired(ikey, metadata) || (metadata.Type() == kRedisBitmap && redis::Bitmap::IsEmptySegment(value));
 }
 
-}  // namespace engine
+}  // namespace Engine
+
+#ifdef KVROCKS_USE_TOPLINGDB
+namespace rocksdb {
+using namespace Engine;
+//ROCKSDB_REG_Plugin(MetadataFilterFactory , CompactionFilterFactory);
+//ROCKSDB_REG_Plugin(SubKeyFilterFactory   , CompactionFilterFactory);
+ROCKSDB_REG_Plugin(PropagateFilterFactory, CompactionFilterFactory);
+ROCKSDB_REG_Plugin(PubSubFilterFactory   , CompactionFilterFactory);
+}
+#endif
