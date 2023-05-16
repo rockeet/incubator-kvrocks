@@ -36,6 +36,9 @@ std::vector<rocksdb::Status> String::getRawValues(const std::vector<Slice> &keys
   rocksdb::ReadOptions read_options;
   LatestSnapShot ss(db_);
   read_options.snapshot = ss.GetSnapShot();
+  read_options.async_io = true;
+  read_options.async_queue_depth = 64;
+  read_options.StartPin();
   raw_values->resize(keys.size());
   std::vector<rocksdb::Status> statuses(keys.size());
   std::vector<rocksdb::PinnableSlice> pin_values(keys.size());
@@ -56,6 +59,7 @@ std::vector<rocksdb::Status> String::getRawValues(const std::vector<Slice> &keys
       continue;
     }
   }
+  read_options.FinishPin();
   return statuses;
 }
 
