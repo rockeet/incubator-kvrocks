@@ -1,7 +1,7 @@
 version: '3'
 services:
   kvrocks:
-    image: wactax/kvrocks
+    image: wactax/kvrocks:nightly
     restart: always
     container_name: kvrocks
     environment:

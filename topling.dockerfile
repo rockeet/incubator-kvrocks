@@ -56,6 +56,7 @@ RUN apt update && apt install -y libssl-dev
 WORKDIR /kvrocks
 
 COPY --from=build /kvrocks/build/kvrocks ./bin/
+COPY --from=build /opt/topling/lib/* /usr/lib/
 
 COPY --from=build /kvrocks/tools/redis-cli ./bin/
 ENV PATH="$PATH:/kvrocks/bin"
