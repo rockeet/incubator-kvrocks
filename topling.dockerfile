@@ -23,18 +23,31 @@ ARG MORE_BUILD_ARGS
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-RUN apt update && apt install -y git gcc g++ make cmake autoconf automake libtool python3 libssl-dev curl
+RUN apt update && apt install -y git gcc g++ make cmake autoconf automake libtool python3 libssl-dev curl libjemalloc-dev libaio-dev libgflags-dev zlib1g-dev libbz2-dev libcurl4-gnutls-dev liburing-dev
+
 WORKDIR /kvrocks
 
-COPY . .
-RUN ./x.py build -DENABLE_OPENSSL=ON -DPORTABLE=ON $MORE_BUILD_ARGS
-
-RUN curl -O https://download.redis.io/releases/redis-6.2.7.tar.gz && \
-    tar -xzvf redis-6.2.7.tar.gz && \
+ENV redis_version=7.2-rc2
+RUN curl -O https://download.redis.io/releases/redis-$redis_version.tar.gz && \
+    tar -xzvf redis-$redis_version.tar.gz && \
     mkdir tools && \
-    cd redis-6.2.7 && \
+    cd redis-$redis_version && \
     make redis-cli && \
     mv src/redis-cli /kvrocks/tools/redis-cli
+
+ENV TOPLINGDB_HOME=/tmp/toplingdb 
+ENV TOPLINGDB_LIBDIR=/opt/topling/lib 
+
+RUN cd /tmp && git clone --depth=1 https://github.com/topling/toplingdb.git && \
+    cd toplingdb && make -j`nproc` DEBUG_LEVEL=0 INSTALL_LIBDIR=$TOPLINGDB_LIBDIR install
+
+COPY . .
+
+RUN ./x.py build -j`nproc` -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_OPENSSL=ON -DPORTABLE=ON $MORE_BUILD_ARGS
+
+# RUN ./x.py build -DENABLE_OPENSSL=ON -DPORTABLE=ON $MORE_BUILD_ARGS
+
 
 FROM ubuntu:22.10
 
