@@ -20,6 +20,4 @@
 
 #include <string>
 
-int main() {
-    return std::string{0}[0];
-}
+int main() { return std::string{0}[0]; }

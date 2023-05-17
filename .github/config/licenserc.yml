@@ -32,6 +32,8 @@ header:
     - '**/*.yml'
     - '**/*.yaml'
   paths-ignore:
+    - 'docker/*'
+    - '.github/**/*.yml'
     - 'src/common/rand.h'
     - 'src/common/rand.cc'
     - 'src/common/rocksdb_crc32c.h'

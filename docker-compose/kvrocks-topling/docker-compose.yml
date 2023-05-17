@@ -1,0 +1,19 @@
+version: '3'
+services:
+  kvrocks-topling:
+    image: wactax/kvrocks-topling
+    restart: always
+    container_name: kvrocks-topling
+    environment:
+      kvrocks_port: 49100
+      kvrocks_workers: 6
+      kvrocks_rocksdb_compression: zstd
+      kvrocks_timeout: 360
+      kvrocks_rocksdb_enable_blob_files: "yes"
+      kvrocks_dir: /data
+      kvrocks_log_dir: /log
+    volumes:
+      - /tmp/kvrocks-topling/data:/data
+      - /tmp/kvrocks-topling/log:/log
+    ports:
+      - 49100:49100

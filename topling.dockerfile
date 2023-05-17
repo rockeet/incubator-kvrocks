@@ -23,7 +23,7 @@ ARG MORE_BUILD_ARGS
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-RUN apt update && apt install -y git gcc g++ make cmake autoconf automake libtool python3 libssl-dev curl libjemalloc-dev libaio-dev libgflags-dev zlib1g-dev libbz2-dev libcurl4-gnutls-dev liburing-dev
+RUN apt update && apt install -y git gcc g++ make cmake autoconf automake libtool python3 libssl-dev curl libjemalloc-dev libaio-dev libgflags-dev zlib1g-dev libbz2-dev libcurl4-gnutls-dev liburing-dev apt-utils pkg-config
 
 WORKDIR /kvrocks
 
@@ -65,6 +65,8 @@ VOLUME /var/lib/kvrocks
 COPY ./LICENSE ./NOTICE ./DISCLAIMER ./
 COPY ./licenses ./licenses
 COPY ./kvrocks.conf  /var/lib/kvrocks/
+COPY ./docker/* /kvrocks/
 
 EXPOSE 6666:6666
-ENTRYPOINT ["./bin/kvrocks", "-c", "/var/lib/kvrocks/kvrocks.conf", "--dir", "/var/lib/kvrocks"]
+
+ENTRYPOINT ["/kvrocks/run.sh"]

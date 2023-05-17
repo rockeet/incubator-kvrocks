@@ -38,11 +38,11 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@v2
 
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v2
 
       - name: Available platforms
         run: echo ${{ steps.buildx.outputs.platforms }}
@@ -54,7 +54,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v4
         with:
-          images: apache/kvrocks
+          images: ${{secrets.DOCKER_ORG}}/kvrocks
           flavor: latest=false
           tags: |
             type=sha,prefix=nightly-{{date 'YYYYMMDD'}}-,format=short
@@ -63,7 +63,8 @@ jobs:
       - uses: docker/build-push-action@v3
         with:
           context: .
-          platforms: linux/amd64, linux/arm64
+          platforms: linux/amd64
+          # platforms: linux/amd64, linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

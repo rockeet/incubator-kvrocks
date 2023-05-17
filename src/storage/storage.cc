@@ -239,14 +239,14 @@ Status Storage::CreateColumnFamilies(const rocksdb::Options &options) {
 }
 
 Status Storage::Open(bool read_only) {
-  if (const char* TOPLING_CONF = getenv("TOPLING_CONF")) {
-    return OpenTopling(TOPLING_CONF);
+  if (const char *topling_conf = getenv("TOPLING_CONF")) {
+    return openTopling(topling_conf);
   } else {
-    return OpenRocks(read_only);
+    return openRocks(read_only);
   }
 }
 
-Status Storage::OpenRocks(bool read_only) {
+Status Storage::openRocks(bool read_only) {
   auto guard = WriteLockGuard();
   db_closing_ = false;
 
@@ -341,27 +341,24 @@ Status Storage::OpenRocks(bool read_only) {
   return Status::OK();
 }
 
-Status Storage::OpenTopling(const char* conf) {
+Status Storage::openTopling(const char *conf) {
 #ifdef KVROCKS_USE_TOPLINGDB
   using rocksdb::CompactionFilterFactory;
-  using std::shared_ptr;
   using std::make_shared;
-  repo_.Put("metadata",
-    R"({"class": "MetadataFilterFactory", "params": {"storage": "this"}})",
-    shared_ptr<CompactionFilterFactory>(make_shared<MetadataFilterFactory>(this)));
-  repo_.Put("subkey",
-    R"({"class": "SubKeyFilterFactory", "params": {"storage": "this"}})",
-    shared_ptr<CompactionFilterFactory>(make_shared<SubKeyFilterFactory>(this)));
-  repo_.Put("listener",
-    R"({"class": "EventListener", "params": {"storage": "this"}})",
-    shared_ptr<rocksdb::EventListener>(make_shared<EventListener>(this)));
+  using std::shared_ptr;
+  repo_.Put("metadata", R"({"class": "MetadataFilterFactory", "params": {"storage": "this"}})",
+            shared_ptr<CompactionFilterFactory>(make_shared<MetadataFilterFactory>(this)));
+  repo_.Put("subkey", R"({"class": "SubKeyFilterFactory", "params": {"storage": "this"}})",
+            shared_ptr<CompactionFilterFactory>(make_shared<SubKeyFilterFactory>(this)));
+  repo_.Put("listener", R"({"class": "EventListener", "params": {"storage": "this"}})",
+            shared_ptr<rocksdb::EventListener>(make_shared<EventListener>(this)));
   auto s = repo_.ImportAutoFile(conf);
   if (!s.ok()) {
     LOG(ERROR) << "[storage] FAIL repo_.ImportAutoFile(" << conf << ") = " << s.ToString();
     return Status(Status::DBOpenErr, "repo_.ImportAutoFile");
   }
   auto start = std::chrono::high_resolution_clock::now();
-  rocksdb::DB_MultiCF* dbm = nullptr;
+  rocksdb::DB_MultiCF *dbm = nullptr;
   s = repo_.OpenDB(&dbm);
   if (!s.ok()) {
     LOG(ERROR) << "[storage] FAIL repo_.OpenDB() = " << s.ToString();
@@ -379,8 +376,7 @@ Status Storage::OpenTopling(const char* conf) {
   }
   return Status::OK();
 #else
-  return Status(Status::DBOpenErr,
-    "Not compiled with ToplingDB, DO NOT start with env TOPLING_CONF");
+  return Status(Status::DBOpenErr, "Not compiled with ToplingDB, DO NOT start with env TOPLING_CONF");
 #endif
 }
 

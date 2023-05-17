@@ -78,8 +78,8 @@ class Storage {
   Status Open(bool read_only = false);
 
  private:
-  Status OpenRocks(bool read_only = false);
-  Status OpenTopling(const char *conf);
+  Status openRocks(bool read_only = false);
+  Status openTopling(const char *conf);
 
  public:
   void CloseDB();

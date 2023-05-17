@@ -145,10 +145,10 @@ bool SubKeyFilter::Filter(int level, const Slice &key, const Slice &value, std::
 
 #ifdef KVROCKS_USE_TOPLINGDB
 namespace rocksdb {
-using namespace Engine;
-//ROCKSDB_REG_Plugin(MetadataFilterFactory , CompactionFilterFactory);
-//ROCKSDB_REG_Plugin(SubKeyFilterFactory   , CompactionFilterFactory);
+using namespace engine;
+// ROCKSDB_REG_Plugin(MetadataFilterFactory , CompactionFilterFactory);
+// ROCKSDB_REG_Plugin(SubKeyFilterFactory   , CompactionFilterFactory);
 ROCKSDB_REG_Plugin(PropagateFilterFactory, CompactionFilterFactory);
-ROCKSDB_REG_Plugin(PubSubFilterFactory   , CompactionFilterFactory);
-}
+ROCKSDB_REG_Plugin(PubSubFilterFactory, CompactionFilterFactory);
+}  // namespace rocksdb
 #endif
