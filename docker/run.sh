@@ -27,7 +27,7 @@ conf dir "dir ${kvrocks_dir-/var/lib/kvrocks}"
 [ -n "$kvrocks_slaveof" ] && conf "# slaveof 127.0.0.1" "slaveof $kvrocks_slaveof"
 [ -n "$kvrocks_dir" ] && conf "dir " "dir $kvrocks_dir"
 
-conf "rocksdb.read_options.async_io " "rocksdb.read_options.async_io yes"
+conf "rocksdb.read_options.async_io " "rocksdb.read_options.async_io $kvrocks_read_options_async_io"
 conf "db-name " "db-name db"
 
 run=$(cat _run.sh)

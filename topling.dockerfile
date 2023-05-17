@@ -46,17 +46,15 @@ COPY . .
 RUN ./x.py build -j`nproc` -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_OPENSSL=ON -DPORTABLE=ON $MORE_BUILD_ARGS
 
-# RUN ./x.py build -DENABLE_OPENSSL=ON -DPORTABLE=ON $MORE_BUILD_ARGS
-
-
 FROM ubuntu:22.10
 
-RUN apt update && apt install -y libssl-dev
+RUN apt update && apt install -y libssl-dev libjemalloc-dev libaio-dev libgflags-dev zlib1g-dev libbz2-dev libcurl4-gnutls-dev liburing-dev libgomp1
 
 WORKDIR /kvrocks
 
 COPY --from=build /kvrocks/build/kvrocks ./bin/
-COPY --from=build /opt/topling/lib/* /usr/lib/
+COPY --from=build /opt/topling/lib /opt/topling/lib
+ENV LD_LIBRARY_PATH=/opt/topling/lib
 
 COPY --from=build /kvrocks/tools/redis-cli ./bin/
 ENV PATH="$PATH:/kvrocks/bin"

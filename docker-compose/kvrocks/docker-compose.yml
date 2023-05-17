@@ -4,16 +4,19 @@ services:
     image: wactax/kvrocks:nightly
     restart: always
     container_name: kvrocks
+    mem_limit: 1G
+    memswap_limit: -1
     environment:
-      kvrocks_port: 49100
+      kvrocks_port: 51002
       kvrocks_workers: 6
       kvrocks_rocksdb_compression: zstd
       kvrocks_timeout: 360
       kvrocks_rocksdb_enable_blob_files: "yes"
+      kvrocks_read_options_async_io: "yes"
       kvrocks_dir: /data
       kvrocks_log_dir: /log
     volumes:
-      - /tmp/kvrocks/data:/data
-      - /tmp/kvrocks/log:/log
+      - /tmp/benchmark/kvrocks/data:/data
+      - /tmp/benchmark/kvrocks/log:/log
     ports:
-      - 49100:49100
+      - 51002:51002

@@ -23,12 +23,16 @@ set -ex
 
 NAME=topling
 
-IMAGE=$DOCKER_USERNAME/kvrocks-$NAME
+IMG=kvrocks-$NAME
+
+if [ -v DOCKER_ORG ]; then
+  IMG=$DOCKER_ORG/$IMG
+fi
 
 VER=nightly
 
-TAG=$IMAGE:$VER
+TAG=$IMG:$VER
 
-DATE=-$(date "+%Y%m%d")
+DATE=$(date "+%Y%m%d")
 
 docker build -t $TAG-$DATE -t $TAG -f $NAME.dockerfile .

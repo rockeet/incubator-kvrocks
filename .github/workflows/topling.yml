@@ -24,9 +24,6 @@ jobs:
           fetch-depth: 1
           submodules: true
       
-      - name: Get core numbers
-        run: echo "NPROC=$(nproc)" >> $GITHUB_ENV
-
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v4
@@ -37,21 +34,19 @@ jobs:
             type=sha,prefix=nightly-{{date 'YYYYMMDD'}}-,format=short
             type=raw,value=nightly
       
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+      # - name: Set up QEMU
+      #   uses: docker/setup-qemu-action@v2
 
-      - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v2
-
+      # - name: Set up Docker Buildx
+      #   id: buildx
+      #   uses: docker/setup-buildx-action@v2
+      
       - uses: docker/build-push-action@v4
         with:
           context: .
-          platforms: linux/amd64, linux/arm64
+          platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           file: 'topling.dockerfile'
-          build-args: |
-            MORE_BUILD_ARGS=-j${{ env.NPROC }}
 
