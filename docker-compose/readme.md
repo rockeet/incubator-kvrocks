@@ -33,11 +33,11 @@ kvrocks_rocksdb_enable_blob_files: "yes"
 kvrocks_read_options_async_io: "yes"
 ```
 
-## [测试代码](https://github.com/wacfork/incubator-kvrocks/blob/unstable/docker-compose/benchmark.sh)
+## 测试代码
 
 每个操作测试的时长是 10 分钟，客户端连接数 50，线程数 20，get/set 测试的读写比例是 100:1 ，数据大小是 4-4096。
 
-测试代码如下：
+测试代码 [./benchmark.sh](https://github.com/wacfork/incubator-kvrocks/blob/unstable/docker-compose/benchmark.sh) 如下，可克隆仓库自己运行：
 
 ```bash
 #!/usr/bin/env bash
