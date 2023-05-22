@@ -33,24 +33,25 @@
 namespace Engine {
 class MetadataFilter : public rocksdb::CompactionFilter {
  public:
-  explicit MetadataFilter(Storage *storage) : stor_(storage) {}
+  MetadataFilter(uint64_t now, bool IsSlotIdEncoded) : now_(now), IsSlotIdEncoded_(IsSlotIdEncoded) {}
   const char *Name() const override { return "MetadataFilter"; }
   bool Filter(int level, const Slice &key, const Slice &value, std::string *new_value, bool *modified) const override;
 
  private:
-  Engine::Storage *stor_;
+  int64_t now_;
+  bool IsSlotIdEncoded_;
 };
 
 class MetadataFilterFactory : public rocksdb::CompactionFilterFactory {
  public:
+  MetadataFilterFactory() = default; ///< for dcompact
   explicit MetadataFilterFactory(Engine::Storage *storage) { stor_ = storage; }
   const char *Name() const override { return "MetadataFilterFactory"; }
   std::unique_ptr<rocksdb::CompactionFilter> CreateCompactionFilter(
-      const rocksdb::CompactionFilter::Context &context) override {
-    return std::unique_ptr<rocksdb::CompactionFilter>(new MetadataFilter(stor_));
-  }
+      const rocksdb::CompactionFilter::Context &context) override;
 
- private:
+  int64_t now_ = 0;
+  bool IsSlotIdEncoded_ = false;
   Engine::Storage *stor_ = nullptr;
 };
 

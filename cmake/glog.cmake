@@ -27,6 +27,6 @@ FetchContent_DeclareGitHubWithMirror(glog
 FetchContent_MakeAvailableWithArgs(glog
   WITH_GFLAGS=OFF
   WITH_GTEST=OFF
-  BUILD_SHARED_LIBS=OFF
+  BUILD_SHARED_LIBS=ON
   WITH_UNWIND=${ENABLE_UNWIND}
 )

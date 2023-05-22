@@ -205,6 +205,7 @@
           "kNoCompression", "kNoCompression", "kNoCompression",
           "kZSTD", "kZSTD","kZSTD","kZSTD"
         ],
+        "compaction_executor_factory": "dcompact",
         "compaction_filter_factory": "${metadata}",
         "//html_user_key_coder": "$base_data_key_decoder"
       },
@@ -340,6 +341,44 @@
           },
           "path": "/nvme-shared/kvrocks/kvrocks_data",
           "comment": "last part of 'path' is 'kvrocks_data', this must be the same with database name"
+        }
+      }
+    },
+    "CompactionExecutorFactory": {
+      "dcompact": {
+        "class": "DcompactEtcd",
+        "params": {
+          "allow_fallback_to_local": true,
+          "//info_log_level": "DEBUG_LEVEL",
+          "estimate_speed": "10M",
+          "timeout_multiplier": 5.0,
+          "hoster_root": "/nvme-shared/kvrocks/kvrocks_data",
+          "instance_name": "kvrocks_data",
+          "nfs_mnt_src": "static-mounted",
+          "nfs_mnt_opt": "",
+          "web_domain": "topling.in",
+          "overall_timeout": 10,
+          "http_max_retry": 3,
+          "http_timeout": 1,
+          "http_workers": [
+            "//http://127.0.0.1:8080",
+            "http://192.168.100.100:8080",
+            "//http://192.168.100.2:8080",
+            "//http://192.168.100.2:8081",
+            { "url": "//http://192.168.100.116:8081", "web_url": "http://dell3.topling.in:2011" },
+            { "url": "//http://192.168.100.117:8081", "base_url": "http://192.168.31.3:55071", "web_url": "http://dell3.topling.in:2011" },
+            "//http://192.168.100.102:8080",
+            "//http://192.168.100.102:8081",
+            "//http://commented-host:8080",
+            "//end_http_workers"
+          ],
+          "dcompact_min_level": 2
+        },
+        "dcompact2" : {
+          "class": "DcompactEtcd",
+          "params": {
+            "template": "${dcompact}"
+          }
         }
       }
     },

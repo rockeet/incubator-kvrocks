@@ -251,6 +251,18 @@ bool Metadata::Expired() const {
   return expire < now;
 }
 
+bool Metadata::Expired(int64_t now) const {
+  if (Type() != kRedisString && Type() != kRedisStream && size == 0) {
+    return true;
+  }
+
+  if (expire <= 0) {
+    return false;
+  }
+
+  return expire < now;
+}
+
 ListMetadata::ListMetadata(bool generate_version) : Metadata(kRedisList, generate_version) {
   head = UINT64_MAX / 2;
   tail = head;

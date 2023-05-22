@@ -124,7 +124,7 @@ def build(dir: str, jobs: Optional[int], ghproxy: bool, ninja: bool, unittest: b
     if skip_build:
         return
 
-    target = ["kvrocks", "kvrocks2redis"]
+    target = ["kvrocks", "kvrocks2redis", "kvrocks_dc"]
     if unittest:
         target.append("unittest")
 

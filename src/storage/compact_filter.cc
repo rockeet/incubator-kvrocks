@@ -19,6 +19,7 @@
  */
 
 #include "compact_filter.h"
+#include "time_util.h"
 
 #include <glog/logging.h>
 
@@ -27,6 +28,8 @@
 
 #include "types/redis_bitmap.h"
 #ifdef KVROCKS_USE_TOPLINGDB
+#include <terark/io/DataIO.hpp>
+#include <terark/io/FileStream.hpp>
 #include <topling/side_plugin_factory.h>
 #endif
 
@@ -38,7 +41,7 @@ bool MetadataFilter::Filter(int level, const Slice &key, const Slice &value, std
   std::string ns, user_key, bytes = value.ToString();
   Metadata metadata(kRedisNone, false);
   rocksdb::Status s = metadata.Decode(bytes);
-  ExtractNamespaceKey(key, &ns, &user_key, stor_->IsSlotIdEncoded());
+  ExtractNamespaceKey(key, &ns, &user_key, IsSlotIdEncoded_);
   if (!s.ok()) {
     LOG(WARNING) << "[compact_filter/metadata] Failed to decode,"
                  << ", namespace: " << ns << ", key: " << user_key << ", err: " << s.ToString();
@@ -46,8 +49,19 @@ bool MetadataFilter::Filter(int level, const Slice &key, const Slice &value, std
   }
   DLOG(INFO) << "[compact_filter/metadata] "
              << "namespace: " << ns << ", key: " << user_key
-             << ", result: " << (metadata.Expired() ? "deleted" : "reserved");
-  return metadata.Expired();
+             << ", result: " << (metadata.Expired(now_) ? "deleted" : "reserved");
+  return metadata.Expired(now_);
+}
+
+std::unique_ptr<rocksdb::CompactionFilter>
+MetadataFilterFactory::CreateCompactionFilter(
+    const rocksdb::CompactionFilter::Context &context) {
+#ifdef KVROCKS_USE_TOPLINGDB
+  auto now = rocksdb::IsCompactionWorker() ? now_ : Util::GetTimeStamp();
+#else
+  auto now = Util::GetTimeStamp();
+#endif
+  return std::make_unique<MetadataFilter>(now, IsSlotIdEncoded_);
 }
 
 Status SubKeyFilter::GetMetadata(const InternalKey &ikey, Metadata *metadata) const {
@@ -142,9 +156,39 @@ bool SubKeyFilter::Filter(int level, const Slice &key, const Slice &value, std::
 #ifdef KVROCKS_USE_TOPLINGDB
 namespace rocksdb {
 using namespace Engine;
-//ROCKSDB_REG_Plugin(MetadataFilterFactory , CompactionFilterFactory);
+ROCKSDB_REG_Plugin(MetadataFilterFactory , CompactionFilterFactory);
 //ROCKSDB_REG_Plugin(SubKeyFilterFactory   , CompactionFilterFactory);
 ROCKSDB_REG_Plugin(PropagateFilterFactory, CompactionFilterFactory);
 ROCKSDB_REG_Plugin(PubSubFilterFactory   , CompactionFilterFactory);
+
+using namespace terark;
+struct MetadataFilterFactory_SerDe : SerDeFunc<CompactionFilterFactory> {
+  void Serialize(FILE* output, const CompactionFilterFactory& base)
+  const override {
+    auto& fac = dynamic_cast<const MetadataFilterFactory&>(base);
+    LittleEndianDataOutput<NonOwnerFileStream> dio(output);
+    if (IsCompactionWorker()) {
+      // do nothing
+    } else {
+      auto now = Util::GetTimeStamp();
+      auto IsSlotIdEncoded = fac.stor_->IsSlotIdEncoded();
+      dio << now;
+      dio << IsSlotIdEncoded;
+    }
+  }
+  void DeSerialize(FILE* reader, CompactionFilterFactory* base)
+  const override {
+    auto fac = dynamic_cast<MetadataFilterFactory*>(base);
+    LittleEndianDataInput<NonOwnerFileStream> dio(reader);
+    if (IsCompactionWorker()) {
+      dio >> fac->now_;
+      dio >> fac->IsSlotIdEncoded_;
+    } else {
+      // do nothing
+    }
+  }
+};
+ROCKSDB_REG_PluginSerDe(MetadataFilterFactory);
+
 }
 #endif
