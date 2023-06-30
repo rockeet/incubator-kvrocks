@@ -28,17 +28,19 @@
 #include "redis_metadata.h"
 #include "storage.h"
 
-namespace Redis {
+namespace redis {
 class Database {
  public:
-  explicit Database(Engine::Storage *storage, const std::string &ns = "");
+  static constexpr uint64_t RANDOM_KEY_SCAN_LIMIT = 60;
+
+  explicit Database(engine::Storage *storage, std::string ns = "");
   rocksdb::Status GetMetadata(RedisType type, const Slice &ns_key, Metadata *metadata);
   rocksdb::Status GetRawMetadata(const Slice &ns_key, std::string *bytes);
   rocksdb::Status GetRawMetadataByUserKey(const Slice &user_key, std::string *bytes);
-  rocksdb::Status Expire(const Slice &user_key, int timestamp);
+  rocksdb::Status Expire(const Slice &user_key, uint64_t timestamp);
   rocksdb::Status Del(const Slice &user_key);
   rocksdb::Status Exists(const std::vector<Slice> &keys, int *ret);
-  rocksdb::Status TTL(const Slice &user_key, int *ttl);
+  rocksdb::Status TTL(const Slice &user_key, int64_t *ttl);
   rocksdb::Status Type(const Slice &user_key, RedisType *type);
   rocksdb::Status Dump(const Slice &user_key, std::vector<std::string> *infos);
   rocksdb::Status FlushDB();
@@ -56,26 +58,30 @@ class Database {
                                   int count);
 
  protected:
-  Engine::Storage *storage_;
-  rocksdb::DB *db_;
+  engine::Storage *storage_;
   rocksdb::ColumnFamilyHandle *metadata_cf_handle_;
   std::string namespace_;
 
+  friend class LatestSnapShot;
   class LatestSnapShot {
    public:
-    explicit LatestSnapShot(rocksdb::DB *db) : db_(db) { snapshot_ = db_->GetSnapshot(); }
-    ~LatestSnapShot() { db_->ReleaseSnapshot(snapshot_); }
+    explicit LatestSnapShot(engine::Storage *storage)
+        : storage_(storage), snapshot_(storage_->GetDB()->GetSnapshot()) {}
+    ~LatestSnapShot() { storage_->GetDB()->ReleaseSnapshot(snapshot_); }
     const rocksdb::Snapshot *GetSnapShot() { return snapshot_; }
 
+    LatestSnapShot(const LatestSnapShot &) = delete;
+    LatestSnapShot &operator=(const LatestSnapShot &) = delete;
+
    private:
-    rocksdb::DB *db_ = nullptr;
+    engine::Storage *storage_ = nullptr;
     const rocksdb::Snapshot *snapshot_ = nullptr;
   };
 };
 
-class SubKeyScanner : public Redis::Database {
+class SubKeyScanner : public redis::Database {
  public:
-  explicit SubKeyScanner(Engine::Storage *storage, const std::string &ns) : Database(storage, ns) {}
+  explicit SubKeyScanner(engine::Storage *storage, const std::string &ns) : Database(storage, ns) {}
   rocksdb::Status Scan(RedisType type, const Slice &user_key, const std::string &cursor, uint64_t limit,
                        const std::string &subkey_prefix, std::vector<std::string> *keys,
                        std::vector<std::string> *values = nullptr);
@@ -97,4 +103,4 @@ class WriteBatchLogData {
   std::vector<std::string> args_;
 };
 
-}  // namespace Redis
+}  // namespace redis

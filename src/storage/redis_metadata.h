@@ -29,6 +29,8 @@
 #include "encoding.h"
 #include "types/redis_stream_base.h"
 
+constexpr bool USE_64BIT_COMMON_FIELD_DEFAULT = METADATA_ENCODING_VERSION != 0;
+
 enum RedisType {
   kRedisNone,
   kRedisString,
@@ -59,8 +61,8 @@ enum RedisCommand {
 const std::vector<std::string> RedisTypeNames = {"none", "string", "hash",      "list",  "set",
                                                  "zset", "bitmap", "sortedint", "stream"};
 
-extern const char *kErrMsgWrongType;
-extern const char *kErrMsgKeyExpired;
+constexpr const char *kErrMsgWrongType = "WRONGTYPE Operation against a key holding the wrong kind of value";
+constexpr const char *kErrMsgKeyExpired = "the key was expired";
 
 using rocksdb::Slice;
 
@@ -79,7 +81,7 @@ class InternalKey {
  public:
   explicit InternalKey(Slice ns_key, Slice sub_key, uint64_t version, bool slot_id_encoded);
   explicit InternalKey(Slice input, bool slot_id_encoded);
-  ~InternalKey();
+  ~InternalKey() = default;
 
   Slice GetNamespace() const;
   Slice GetKey() const;
@@ -93,33 +95,57 @@ class InternalKey {
   Slice key_;
   Slice sub_key_;
   uint64_t version_;
-  char *buf_;
-  char prealloc_[256];
   uint16_t slotid_;
   bool slot_id_encoded_;
 };
 
+constexpr uint8_t METADATA_64BIT_ENCODING_MASK = 0x80;
+constexpr uint8_t METADATA_TYPE_MASK = 0x0f;
+
 class Metadata {
  public:
+  // metadata flags
+  // <(1-bit) 64bit-common-field-indicator> 0 0 0 <(4-bit) redis-type>
+  // 64bit-common-field-indicator: make `expire` and `size` 64bit instead of 32bit
+  // NOTE: `expire` is stored in milliseconds for 64bit, seconds for 32bit
+  // redis-type: RedisType for the key-value
   uint8_t flags;
-  int expire;
-  uint64_t version;
-  uint32_t size;
 
- public:
-  explicit Metadata(RedisType type, bool generate_version = true);
+  // expire timestamp, in milliseconds
+  uint64_t expire;
+
+  // the current version: 53bit timestamp + 11bit counter
+  uint64_t version;
+
+  // element size of the key-value
+  uint64_t size;
+
+  explicit Metadata(RedisType type, bool generate_version = true,
+                    bool use_64bit_common_field = USE_64BIT_COMMON_FIELD_DEFAULT);
   static void InitVersionCounter();
 
+  static size_t GetOffsetAfterExpire(uint8_t flags);
+  static size_t GetOffsetAfterSize(uint8_t flags);
+  static uint64_t ExpireMsToS(uint64_t ms);
+
+  bool Is64BitEncoded() const;
+  bool GetFixedCommon(rocksdb::Slice *input, uint64_t *value) const;
+  bool GetExpire(rocksdb::Slice *input);
+  void PutFixedCommon(std::string *dst, uint64_t value) const;
+  void PutExpire(std::string *dst) const;
+
   RedisType Type() const;
-  virtual int32_t TTL() const;
-  virtual timeval Time() const;
-  virtual bool Expired() const;
+  size_t CommonEncodedSize() const;
+  int64_t TTL() const;
+  timeval Time() const;
+  bool Expired() const;
+  bool ExpireAt(uint64_t expired_ts) const;
   virtual void Encode(std::string *dst);
   virtual rocksdb::Status Decode(const std::string &bytes);
   bool operator==(const Metadata &that) const;
 
  private:
-  uint64_t generateVersion();
+  static uint64_t generateVersion();
 };
 
 class HashMetadata : public Metadata {
@@ -153,23 +179,21 @@ class ListMetadata : public Metadata {
   uint64_t tail;
   explicit ListMetadata(bool generate_version = true);
 
- public:
   void Encode(std::string *dst) override;
   rocksdb::Status Decode(const std::string &bytes) override;
 };
 
 class StreamMetadata : public Metadata {
  public:
-  Redis::StreamEntryID last_generated_id;
-  Redis::StreamEntryID recorded_first_entry_id;
-  Redis::StreamEntryID max_deleted_entry_id;
-  Redis::StreamEntryID first_entry_id;
-  Redis::StreamEntryID last_entry_id;
+  redis::StreamEntryID last_generated_id;
+  redis::StreamEntryID recorded_first_entry_id;
+  redis::StreamEntryID max_deleted_entry_id;
+  redis::StreamEntryID first_entry_id;
+  redis::StreamEntryID last_entry_id;
   uint64_t entries_added = 0;
 
   explicit StreamMetadata(bool generate_version = true) : Metadata(kRedisStream, generate_version) {}
 
- public:
   void Encode(std::string *dst) override;
   rocksdb::Status Decode(const std::string &bytes) override;
 };

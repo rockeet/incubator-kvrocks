@@ -24,29 +24,23 @@
 #include <string>
 #include <thread>
 
-LockManager::LockManager(int hash_power) : hash_power_(hash_power) {
-  hash_mask_ = (1U << hash_power) - 1;
+LockManager::LockManager(int hash_power) : hash_power_(hash_power), hash_mask_((1U << hash_power) - 1) {
   for (unsigned i = 0; i < Size(); i++) {
-    mutex_pool_.emplace_back(new std::mutex());
+    mutex_pool_.emplace_back(new std::mutex{});
   }
 }
 
-LockManager::~LockManager() {
-  for (const auto &mu : mutex_pool_) {
-    delete mu;
-  }
+unsigned LockManager::hash(const rocksdb::Slice &key) const {
+  return std::hash<std::string_view>{}(std::string_view{key.data(), key.size()}) & hash_mask_;
 }
 
-unsigned LockManager::hash(const rocksdb::Slice &key) { return std::hash<std::string>{}(key.ToString()) & hash_mask_; }
-
-unsigned LockManager::Size() { return (1U << hash_power_); }
+unsigned LockManager::Size() const { return (1U << hash_power_); }
 
 void LockManager::Lock(const rocksdb::Slice &key) { mutex_pool_[hash(key)]->lock(); }
 
 void LockManager::UnLock(const rocksdb::Slice &key) { mutex_pool_[hash(key)]->unlock(); }
 
 std::vector<std::mutex *> LockManager::MultiGet(const std::vector<std::string> &keys) {
-  std::vector<std::mutex *> locks;
   std::set<unsigned, std::greater<unsigned>> to_acquire_indexes;
   // We are using the `set` to avoid retrieving the mutex, as well as guarantee to retrieve
   // the order of locks.
@@ -59,9 +53,10 @@ std::vector<std::mutex *> LockManager::MultiGet(const std::vector<std::string> &
     to_acquire_indexes.insert(hash(key));
   }
 
+  std::vector<std::mutex *> locks;
   locks.reserve(to_acquire_indexes.size());
-  for (const auto &index : to_acquire_indexes) {
-    locks.emplace_back(mutex_pool_[index]);
+  for (auto index : to_acquire_indexes) {
+    locks.emplace_back(mutex_pool_[index].get());
   }
   return locks;
 }

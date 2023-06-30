@@ -22,6 +22,7 @@
 
 #include <rocksdb/status.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,21 +31,23 @@
 
 using rocksdb::Slice;
 
-namespace Redis {
+namespace redis {
 
 class Stream : public SubKeyScanner {
  public:
-  explicit Stream(Engine::Storage *storage, const std::string &ns)
+  explicit Stream(engine::Storage *storage, const std::string &ns)
       : SubKeyScanner(storage, ns), stream_cf_handle_(storage->GetCFHandle("stream")) {}
   rocksdb::Status Add(const Slice &stream_name, const StreamAddOptions &options, const std::vector<std::string> &values,
                       StreamEntryID *id);
   rocksdb::Status DeleteEntries(const Slice &stream_name, const std::vector<StreamEntryID> &ids, uint64_t *ret);
-  rocksdb::Status Len(const Slice &stream_name, uint64_t *ret);
+  rocksdb::Status Len(const Slice &stream_name, const StreamLenOptions &options, uint64_t *ret);
   rocksdb::Status GetStreamInfo(const Slice &stream_name, bool full, uint64_t count, StreamInfo *info);
   rocksdb::Status Range(const Slice &stream_name, const StreamRangeOptions &options, std::vector<StreamEntry> *entries);
   rocksdb::Status Trim(const Slice &stream_name, const StreamTrimOptions &options, uint64_t *ret);
   rocksdb::Status GetMetadata(const Slice &stream_name, StreamMetadata *metadata);
   rocksdb::Status GetLastGeneratedID(const Slice &stream_name, StreamEntryID *id);
+  rocksdb::Status SetId(const Slice &stream_name, const StreamEntryID &last_generated_id,
+                        std::optional<uint64_t> entries_added, std::optional<StreamEntryID> max_deleted_id);
 
  private:
   rocksdb::ColumnFamilyHandle *stream_cf_handle_;
@@ -56,10 +59,8 @@ class Stream : public SubKeyScanner {
   StreamEntryID entryIDFromInternalKey(const rocksdb::Slice &key) const;
   std::string internalKeyFromEntryID(const std::string &ns_key, const StreamMetadata &metadata,
                                      const StreamEntryID &id) const;
-  rocksdb::Status getNextEntryID(const StreamMetadata &metadata, const StreamAddOptions &options, bool first_entry,
-                                 StreamEntryID *next_entry_id) const;
   uint64_t trim(const std::string &ns_key, const StreamTrimOptions &options, StreamMetadata *metadata,
                 rocksdb::WriteBatch *batch);
 };
 
-}  // namespace Redis
+}  // namespace redis

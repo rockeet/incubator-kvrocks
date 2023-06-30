@@ -24,17 +24,20 @@
 
 #include <deque>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "commands/redis_cmd.h"
+#include "commands/commander.h"
+#include "event_util.h"
 #include "redis_request.h"
 
 class Worker;
 
-namespace Redis {
-class Connection {
+namespace redis {
+
+class Connection : public EvbufCallbackBase<Connection> {
  public:
   enum Flag {
     kSlave = 1 << 4,
@@ -47,34 +50,37 @@ class Connection {
   explicit Connection(bufferevent *bev, Worker *owner);
   ~Connection();
 
+  Connection(const Connection &) = delete;
+  Connection &operator=(const Connection &) = delete;
+
   void Close();
   void Detach();
-  static void OnRead(struct bufferevent *bev, void *ctx);
-  static void OnWrite(struct bufferevent *bev, void *ctx);
-  static void OnEvent(bufferevent *bev, int16_t events, void *ctx);
+  void OnRead(struct bufferevent *bev);
+  void OnWrite(struct bufferevent *bev);
+  void OnEvent(bufferevent *bev, int16_t events);
   void Reply(const std::string &msg);
   void SendFile(int fd);
   std::string ToString();
 
-  using unsubscribe_callback = std::function<void(std::string, int)>;
+  using UnsubscribeCallback = std::function<void(std::string, int)>;
   void SubscribeChannel(const std::string &channel);
-  void UnSubscribeChannel(const std::string &channel);
-  void UnSubscribeAll(const unsubscribe_callback &reply = nullptr);
+  void UnsubscribeChannel(const std::string &channel);
+  void UnsubscribeAll(const UnsubscribeCallback &reply = nullptr);
   int SubscriptionsCount();
   void PSubscribeChannel(const std::string &pattern);
-  void PUnSubscribeChannel(const std::string &pattern);
-  void PUnSubscribeAll(const unsubscribe_callback &reply = nullptr);
+  void PUnsubscribeChannel(const std::string &pattern);
+  void PUnsubscribeAll(const UnsubscribeCallback &reply = nullptr);
   int PSubscriptionsCount();
 
-  uint64_t GetAge();
-  uint64_t GetIdleTime();
+  uint64_t GetAge() const;
+  uint64_t GetIdleTime() const;
   void SetLastInteraction();
   std::string GetFlags();
   void EnableFlag(Flag flag);
   void DisableFlag(Flag flag);
   bool IsFlagEnabled(Flag flag);
 
-  uint64_t GetID() { return id_; }
+  uint64_t GetID() const { return id_; }
   void SetID(uint64_t id) { id_ = id; }
   std::string GetName() { return name_; }
   void SetName(std::string name) { name_ = std::move(name); }
@@ -82,21 +88,24 @@ class Connection {
   void SetAddr(std::string ip, uint32_t port);
   void SetLastCmd(std::string cmd) { last_cmd_ = std::move(cmd); }
   std::string GetIP() { return ip_; }
-  int GetPort() { return port_; }
+  uint32_t GetPort() const { return port_; }
   void SetListeningPort(int port) { listening_port_ = port; }
-  int GetListeningPort() { return listening_port_; }
+  int GetListeningPort() const { return listening_port_; }
+  void SetAnnounceIP(std::string ip) { announce_ip_ = std::move(ip); }
+  std::string GetAnnounceIP() { return !announce_ip_.empty() ? announce_ip_ : ip_; }
+  std::string GetAnnounceAddr() { return GetAnnounceIP() + ":" + std::to_string(listening_port_); }
   uint64_t GetClientType();
   Server *GetServer() { return svr_; }
 
-  bool IsAdmin() { return is_admin_; }
+  bool IsAdmin() const { return is_admin_; }
   void BecomeAdmin() { is_admin_ = true; }
   void BecomeUser() { is_admin_ = false; }
   std::string GetNamespace() { return ns_; }
   void SetNamespace(std::string ns) { ns_ = std::move(ns); }
 
-  void NeedClose() { need_close_ = true; }
-  void NeedNotClose() { need_close_ = false; }
-  bool IsNeedClose() { return need_close_; }
+  void NeedFreeBufferEvent(bool need_free = true) { need_free_bev_ = need_free; }
+  void NeedNotFreeBufferEvent() { NeedFreeBufferEvent(false); }
+  bool IsNeedFreeBufferEvent() const { return need_free_bev_; }
 
   Worker *Owner() { return owner_; }
   int GetFD() { return bufferevent_getfd(bev_); }
@@ -104,47 +113,52 @@ class Connection {
   evbuffer *Output() { return bufferevent_get_output(bev_); }
   bufferevent *GetBufferEvent() { return bev_; }
   void ExecuteCommands(std::deque<CommandTokens> *to_process_cmds);
-  bool isProfilingEnabled(const std::string &cmd);
-  void recordProfilingSampleIfNeed(const std::string &cmd, uint64_t duration);
+  bool IsProfilingEnabled(const std::string &cmd);
+  void RecordProfilingSampleIfNeed(const std::string &cmd, uint64_t duration);
   void SetImporting() { importing_ = true; }
-  bool IsImporting() { return importing_; }
+  bool IsImporting() const { return importing_; }
 
   // Multi exec
   void SetInExec() { in_exec_ = true; }
-  bool IsInExec() { return in_exec_; }
-  bool IsMultiError() { return multi_error_; }
+  bool IsInExec() const { return in_exec_; }
+  bool IsMultiError() const { return multi_error_; }
   void ResetMultiExec();
-  std::deque<Redis::CommandTokens> *GetMultiExecCommands() { return &multi_cmds_; }
+  std::deque<redis::CommandTokens> *GetMultiExecCommands() { return &multi_cmds_; }
 
-  std::unique_ptr<Commander> current_cmd_;
-  std::function<void(int)> close_cb_ = nullptr;
+  std::unique_ptr<Commander> current_cmd;
+  std::function<void(int)> close_cb = nullptr;
+
+  std::set<std::string> watched_keys;
+  std::atomic<bool> watched_keys_modified = false;
 
  private:
   uint64_t id_ = 0;
-  int flags_ = 0;
+  std::atomic<int> flags_ = 0;
   std::string ns_;
   std::string name_;
   std::string ip_;
+  std::string announce_ip_;
   uint32_t port_ = 0;
   std::string addr_;
   int listening_port_ = 0;
   bool is_admin_ = false;
-  bool need_close_ = true;
+  bool need_free_bev_ = true;
   std::string last_cmd_;
-  time_t create_time_;
-  time_t last_interaction_;
+  int64_t create_time_;
+  int64_t last_interaction_;
 
   bufferevent *bev_;
   Request req_;
   Worker *owner_;
   std::vector<std::string> subscribe_channels_;
-  std::vector<std::string> subcribe_patterns_;
+  std::vector<std::string> subscribe_patterns_;
 
   Server *svr_;
   bool in_exec_ = false;
   bool multi_error_ = false;
-  std::deque<Redis::CommandTokens> multi_cmds_;
+  std::deque<redis::CommandTokens> multi_cmds_;
 
   bool importing_ = false;
 };
-}  // namespace Redis
+
+}  // namespace redis

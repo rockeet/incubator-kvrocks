@@ -23,9 +23,12 @@
 #include <event2/util.h>
 #include <glog/logging.h>
 
+#include <stdexcept>
 #include <string>
 
+#include "event2/bufferevent.h"
 #include "io_util.h"
+#include "scope_exit.h"
 #include "thread_util.h"
 #include "time_util.h"
 
@@ -41,8 +44,6 @@
 #include <sys/un.h>
 
 #include <algorithm>
-#include <cctype>
-#include <cstring>
 #include <list>
 #include <utility>
 
@@ -51,13 +52,12 @@
 #include "server.h"
 #include "storage/scripting.h"
 
-Worker::Worker(Server *svr, Config *config, bool repl) : svr_(svr) {
-  base_ = event_base_new();
-  if (!base_) throw std::exception();
+Worker::Worker(Server *svr, Config *config) : svr(svr), base_(event_base_new()) {
+  if (!base_) throw std::runtime_error{"event base failed to be created"};
 
-  timer_ = event_new(base_, -1, EV_PERSIST, TimerCB, this);
+  timer_.reset(NewEvent(base_, -1, EV_PERSIST));
   timeval tm = {10, 0};
-  evtimer_add(timer_, &tm);
+  evtimer_add(timer_.get(), &tm);
 
   uint32_t ports[3] = {config->port, config->tls_port, 0};
   auto binds = config->binds;
@@ -66,17 +66,19 @@ Worker::Worker(Server *svr, Config *config, bool repl) : svr_(svr) {
     for (const auto &bind : binds) {
       Status s = listenTCP(bind, *port, config->backlog);
       if (!s.IsOK()) {
-        LOG(ERROR) << "[worker] Failed to listen on: " << bind << ":" << *port << ", encounter error: " << s.Msg();
+        LOG(ERROR) << "[worker] Failed to listen on: " << bind << ":" << *port << ". Error: " << s.Msg();
         exit(1);
       }
       LOG(INFO) << "[worker] Listening on: " << bind << ":" << *port;
     }
   }
-  lua_ = Lua::CreateState(true);
+  lua_ = lua::CreateState(true);
 }
 
 Worker::~Worker() {
-  std::list<Redis::Connection *> conns;
+  std::vector<redis::Connection *> conns;
+  conns.reserve(conns_.size() + monitor_conns_.size());
+
   for (const auto &iter : conns_) {
     conns.emplace_back(iter.second);
   }
@@ -86,59 +88,63 @@ Worker::~Worker() {
   for (const auto &iter : conns) {
     iter->Close();
   }
-  event_free(timer_);
-  if (rate_limit_group_ != nullptr) {
+
+  timer_.reset();
+  if (rate_limit_group_) {
     bufferevent_rate_limit_group_free(rate_limit_group_);
   }
-  if (rate_limit_group_cfg_ != nullptr) {
+  if (rate_limit_group_cfg_) {
     ev_token_bucket_cfg_free(rate_limit_group_cfg_);
   }
   event_base_free(base_);
-  Lua::DestroyState(lua_);
+  lua::DestroyState(lua_);
 }
 
-void Worker::TimerCB(int, int16_t events, void *ctx) {
-  auto worker = static_cast<Worker *>(ctx);
-  auto config = worker->svr_->GetConfig();
+void Worker::TimerCB(int, int16_t events) {
+  auto config = svr->GetConfig();
   if (config->timeout == 0) return;
-  worker->KickoutIdleClients(config->timeout);
+  KickoutIdleClients(config->timeout);
 }
 
 void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, sockaddr *address, int socklen, void *ctx) {
   auto worker = static_cast<Worker *>(ctx);
-  int local_port = Util::GetLocalPort(fd);  // NOLINT
+  int local_port = util::GetLocalPort(fd);  // NOLINT
   DLOG(INFO) << "[worker] New connection: fd=" << fd << " from port: " << local_port << " thread #" << worker->tid_;
-  auto s = Util::SockSetTcpKeepalive(fd, 120);
+
+  auto s = util::SockSetTcpKeepalive(fd, 120);
   if (!s.IsOK()) {
-    LOG(ERROR) << "[worker] Failed to set tcp-keepalive, err:" << s.Msg();
+    LOG(ERROR) << "[worker] Failed to set tcp-keepalive on socket. Error: " << s.Msg();
     evutil_closesocket(fd);
     return;
   }
-  s = Util::SockSetTcpNoDelay(fd, 1);
+
+  s = util::SockSetTcpNoDelay(fd, 1);
   if (!s.IsOK()) {
-    LOG(ERROR) << "[worker] Failed to set tcp-nodelay, err:" << s.Msg();
+    LOG(ERROR) << "[worker] Failed to set tcp-nodelay on socket. Error: " << s.Msg();
     evutil_closesocket(fd);
     return;
   }
+
   event_base *base = evconnlistener_get_base(listener);
-  auto evThreadSafeFlags = BEV_OPT_THREADSAFE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_UNLOCK_CALLBACKS;
+  auto ev_thread_safe_flags =
+      BEV_OPT_THREADSAFE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_UNLOCK_CALLBACKS | BEV_OPT_CLOSE_ON_FREE;
 
   bufferevent *bev = nullptr;
 #ifdef ENABLE_OPENSSL
   SSL *ssl = nullptr;
-  if (local_port == worker->svr_->GetConfig()->tls_port) {
-    ssl = SSL_new(worker->svr_->ssl_ctx_.get());
+  if (uint32_t(local_port) == worker->svr->GetConfig()->tls_port) {
+    ssl = SSL_new(worker->svr->ssl_ctx.get());
     if (!ssl) {
       LOG(ERROR) << "Failed to construct SSL structure for new connection: " << SSLErrors{};
       evutil_closesocket(fd);
       return;
     }
-    bev = bufferevent_openssl_socket_new(base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, evThreadSafeFlags);
+    bev = bufferevent_openssl_socket_new(base, fd, ssl, BUFFEREVENT_SSL_ACCEPTING, ev_thread_safe_flags);
   } else {
-    bev = bufferevent_socket_new(base, fd, evThreadSafeFlags);
+    bev = bufferevent_socket_new(base, fd, ev_thread_safe_flags);
   }
 #else
-  bev = bufferevent_socket_new(base, fd, evThreadSafeFlags);
+  bev = bufferevent_socket_new(base, fd, ev_thread_safe_flags);
 #endif
   if (!bev) {
     auto socket_err = evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR());
@@ -152,26 +158,32 @@ void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, sock
     return;
   }
 #ifdef ENABLE_OPENSSL
-  if (local_port == worker->svr_->GetConfig()->tls_port) {
+  if (uint32_t(local_port) == worker->svr->GetConfig()->tls_port) {
     bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
   }
 #endif
-  auto conn = new Redis::Connection(bev, worker);
-  bufferevent_setcb(bev, Redis::Connection::OnRead, Redis::Connection::OnWrite, Redis::Connection::OnEvent, conn);
+  auto conn = new redis::Connection(bev, worker);
+  conn->SetCB(bev);
   bufferevent_enable(bev, EV_READ);
-  Status status = worker->AddConnection(conn);
-  if (!status.IsOK()) {
-    std::string err_msg = Redis::Error("ERR " + status.Msg());
-    Util::SockSend(fd, err_msg);
+
+  s = worker->AddConnection(conn);
+  if (!s.IsOK()) {
+    std::string err_msg = redis::Error("ERR " + s.Msg());
+    s = util::SockSend(fd, err_msg);
+    if (!s.IsOK()) {
+      LOG(WARNING) << "Failed to send error response to socket: " << s.Msg();
+    }
     conn->Close();
     return;
   }
+
   std::string ip;
   uint32_t port = 0;
-  if (Util::GetPeerAddr(fd, &ip, &port) == 0) {
+  if (util::GetPeerAddr(fd, &ip, &port) == 0) {
     conn->SetAddr(ip, port);
   }
-  if (worker->rate_limit_group_ != nullptr) {
+
+  if (worker->rate_limit_group_) {
     bufferevent_add_to_rate_limit_group(bev, worker->rate_limit_group_);
   }
 }
@@ -179,94 +191,103 @@ void Worker::newTCPConnection(evconnlistener *listener, evutil_socket_t fd, sock
 void Worker::newUnixSocketConnection(evconnlistener *listener, evutil_socket_t fd, sockaddr *address, int socklen,
                                      void *ctx) {
   auto worker = static_cast<Worker *>(ctx);
-  DLOG(INFO) << "[worker] New connection: fd=" << fd << " from unixsocket: " << worker->svr_->GetConfig()->unixsocket
+  DLOG(INFO) << "[worker] New connection: fd=" << fd << " from unixsocket: " << worker->svr->GetConfig()->unixsocket
              << " thread #" << worker->tid_;
   event_base *base = evconnlistener_get_base(listener);
-  auto evThreadSafeFlags = BEV_OPT_THREADSAFE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_UNLOCK_CALLBACKS;
-  bufferevent *bev = bufferevent_socket_new(base, fd, evThreadSafeFlags);
-  auto conn = new Redis::Connection(bev, worker);
-  bufferevent_setcb(bev, Redis::Connection::OnRead, Redis::Connection::OnWrite, Redis::Connection::OnEvent, conn);
+  auto ev_thread_safe_flags =
+      BEV_OPT_THREADSAFE | BEV_OPT_DEFER_CALLBACKS | BEV_OPT_UNLOCK_CALLBACKS | BEV_OPT_CLOSE_ON_FREE;
+  bufferevent *bev = bufferevent_socket_new(base, fd, ev_thread_safe_flags);
+
+  auto conn = new redis::Connection(bev, worker);
+  conn->SetCB(bev);
   bufferevent_enable(bev, EV_READ);
-  Status status = worker->AddConnection(conn);
-  if (!status.IsOK()) {
-    std::string err_msg = Redis::Error("ERR " + status.Msg());
-    Util::SockSend(fd, err_msg);
+
+  auto s = worker->AddConnection(conn);
+  if (!s.IsOK()) {
+    std::string err_msg = redis::Error("ERR " + s.Msg());
+    s = util::SockSend(fd, err_msg);
+    if (!s.IsOK()) {
+      LOG(WARNING) << "Failed to send error response to socket: " << s.Msg();
+    }
     conn->Close();
     return;
   }
-  conn->SetAddr(worker->svr_->GetConfig()->unixsocket, 0);
-  if (worker->rate_limit_group_ != nullptr) {
+
+  conn->SetAddr(worker->svr->GetConfig()->unixsocket, 0);
+  if (worker->rate_limit_group_) {
     bufferevent_add_to_rate_limit_group(bev, worker->rate_limit_group_);
   }
 }
 
 Status Worker::listenTCP(const std::string &host, uint32_t port, int backlog) {
-  int af = 0, rv = 0, fd = 0, sock_opt = 1;
+  bool ipv6_used = strchr(host.data(), ':');
 
-  if (strchr(host.data(), ':')) {
-    af = AF_INET6;
-  } else {
-    af = AF_INET;
-  }
-  struct addrinfo hints, *srv_info = nullptr, *p = nullptr;
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = af;
+  addrinfo hints = {};
+  hints.ai_family = ipv6_used ? AF_INET6 : AF_INET;
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_flags = AI_PASSIVE;
 
-  if ((rv = getaddrinfo(host.data(), std::to_string(port).c_str(), &hints, &srv_info)) != 0) {
-    return Status(Status::NotOK, gai_strerror(rv));
+  addrinfo *srv_info = nullptr;
+  if (int rv = getaddrinfo(host.data(), std::to_string(port).c_str(), &hints, &srv_info); rv != 0) {
+    return {Status::NotOK, gai_strerror(rv)};
   }
+  auto exit = MakeScopeExit([srv_info] { freeaddrinfo(srv_info); });
 
-  for (p = srv_info; p != nullptr; p = p->ai_next) {
-    if ((fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) continue;
-    if (af == AF_INET6 && setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &sock_opt, sizeof(sock_opt)) == -1) {
-      goto error;
+  for (auto p = srv_info; p != nullptr; p = p->ai_next) {
+    int fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (fd == -1) continue;
+
+    int sock_opt = 1;
+    if (ipv6_used && setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &sock_opt, sizeof(sock_opt)) == -1) {
+      return {Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR())};
     }
+
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &sock_opt, sizeof(sock_opt)) < 0) {
-      goto error;
+      return {Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR())};
     }
+
     // to support multi-thread binding on macOS
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &sock_opt, sizeof(sock_opt)) < 0) {
-      goto error;
+      return {Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR())};
     }
+
     if (bind(fd, p->ai_addr, p->ai_addrlen)) {
-      goto error;
+      return {Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR())};
     }
+
     evutil_make_socket_nonblocking(fd);
     auto lev = evconnlistener_new(base_, newTCPConnection, this, LEV_OPT_CLOSE_ON_FREE, backlog, fd);
     listen_events_.emplace_back(lev);
   }
 
-  freeaddrinfo(srv_info);
   return Status::OK();
-
-error:
-  freeaddrinfo(srv_info);
-  return Status(Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
 }
 
 Status Worker::ListenUnixSocket(const std::string &path, int perm, int backlog) {
   unlink(path.c_str());
   sockaddr_un sa{};
   if (path.size() > sizeof(sa.sun_path) - 1) {
-    return Status(Status::NotOK, "unix socket path too long");
+    return {Status::NotOK, "unix socket path too long"};
   }
+
   sa.sun_family = AF_LOCAL;
   strncpy(sa.sun_path, path.c_str(), sizeof(sa.sun_path) - 1);
   int fd = socket(AF_LOCAL, SOCK_STREAM, 0);
   if (fd == -1) {
-    return Status(Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
+    return {Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR())};
   }
+
   if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-    return Status(Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
+    return {Status::NotOK, evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR())};
   }
+
   evutil_make_socket_nonblocking(fd);
   auto lev = evconnlistener_new(base_, newUnixSocketConnection, this, LEV_OPT_CLOSE_ON_FREE, backlog, fd);
   listen_events_.emplace_back(lev);
   if (perm != 0) {
     chmod(sa.sun_path, (mode_t)perm);
   }
+
   return Status::OK();
 }
 
@@ -280,90 +301,96 @@ void Worker::Run(std::thread::id tid) {
 void Worker::Stop() {
   event_base_loopbreak(base_);
   for (const auto &lev : listen_events_) {
-    evutil_socket_t fd = evconnlistener_get_fd(lev);
-    if (fd > 0) close(fd);
+    // It's unnecessary to close the listener fd since we have set the LEV_OPT_CLOSE_ON_FREE flag
     evconnlistener_free(lev);
   }
 }
 
-Status Worker::AddConnection(Redis::Connection *c) {
+Status Worker::AddConnection(redis::Connection *c) {
   std::unique_lock<std::mutex> lock(conns_mu_);
   auto iter = conns_.find(c->GetFD());
   if (iter != conns_.end()) {
-    return Status(Status::NotOK, "connection was exists");
+    return {Status::NotOK, "connection was exists"};
   }
-  int max_clients = svr_->GetConfig()->maxclients;
-  if (svr_->IncrClientNum() >= max_clients) {
-    svr_->DecrClientNum();
-    return Status(Status::NotOK, "max number of clients reached");
+
+  int max_clients = svr->GetConfig()->maxclients;
+  if (svr->IncrClientNum() >= max_clients) {
+    svr->DecrClientNum();
+    return {Status::NotOK, "max number of clients reached"};
   }
-  conns_.insert(std::pair<int, Redis::Connection *>(c->GetFD(), c));
-  uint64_t id = svr_->GetClientID()->fetch_add(1, std::memory_order_relaxed);
+
+  conns_.insert(std::pair<int, redis::Connection *>(c->GetFD(), c));
+  uint64_t id = svr->GetClientID();
   c->SetID(id);
+
   return Status::OK();
 }
 
-Redis::Connection *Worker::removeConnection(int fd) {
-  Redis::Connection *conn = nullptr;
+redis::Connection *Worker::removeConnection(int fd) {
+  redis::Connection *conn = nullptr;
+
   std::unique_lock<std::mutex> lock(conns_mu_);
   auto iter = conns_.find(fd);
   if (iter != conns_.end()) {
     conn = iter->second;
     conns_.erase(iter);
-    svr_->DecrClientNum();
+    svr->DecrClientNum();
   }
+
   iter = monitor_conns_.find(fd);
   if (iter != monitor_conns_.end()) {
     conn = iter->second;
     monitor_conns_.erase(iter);
-    svr_->DecrClientNum();
-    svr_->DecrMonitorClientNum();
+    svr->DecrClientNum();
+    svr->DecrMonitorClientNum();
   }
+
   return conn;
 }
 
-void Worker::DetachConnection(Redis::Connection *conn) {
+void Worker::DetachConnection(redis::Connection *conn) {
   if (!conn) return;
+
   removeConnection(conn->GetFD());
-  if (rate_limit_group_ != nullptr) {
+
+  if (rate_limit_group_) {
     bufferevent_remove_from_rate_limit_group(conn->GetBufferEvent());
   }
+
   auto bev = conn->GetBufferEvent();
   bufferevent_disable(bev, EV_READ | EV_WRITE);
   bufferevent_setcb(bev, nullptr, nullptr, nullptr, nullptr);
 }
 
-void Worker::FreeConnection(Redis::Connection *conn) {
+void Worker::FreeConnection(redis::Connection *conn) {
   if (!conn) return;
+
   removeConnection(conn->GetFD());
-  if (rate_limit_group_ != nullptr) {
+  svr->ResetWatchedKeys(conn);
+  if (rate_limit_group_) {
     bufferevent_remove_from_rate_limit_group(conn->GetBufferEvent());
   }
-#ifdef ENABLE_OPENSSL
-  if (SSL *ssl = bufferevent_openssl_get_ssl(conn->GetBufferEvent())) {
-    SSL_free(ssl);
-  }
-#endif
   delete conn;
 }
 
 void Worker::FreeConnectionByID(int fd, uint64_t id) {
   std::unique_lock<std::mutex> lock(conns_mu_);
-  auto conn_iter = conns_.find(fd);
-  if (conn_iter != conns_.end() && conn_iter->second->GetID() == id) {
+  auto iter = conns_.find(fd);
+  if (iter != conns_.end() && iter->second->GetID() == id) {
     if (rate_limit_group_ != nullptr) {
-      bufferevent_remove_from_rate_limit_group(conn_iter->second->GetBufferEvent());
+      bufferevent_remove_from_rate_limit_group(iter->second->GetBufferEvent());
     }
-    delete conn_iter->second;
-    conns_.erase(conn_iter);
-    svr_->DecrClientNum();
+    delete iter->second;
+    conns_.erase(iter);
+    svr->DecrClientNum();
   }
-  auto monitor_conn_iter = monitor_conns_.find(fd);
-  if (monitor_conn_iter != monitor_conns_.end() && monitor_conn_iter->second->GetID() == id) {
-    delete monitor_conn_iter->second;
-    monitor_conns_.erase(monitor_conn_iter);
-    svr_->DecrClientNum();
-    svr_->DecrMonitorClientNum();
+
+  iter = monitor_conns_.find(fd);
+  if (iter != monitor_conns_.end() && iter->second->GetID() == id) {
+    delete iter->second;
+    monitor_conns_.erase(iter);
+    svr->DecrClientNum();
+    svr->DecrMonitorClientNum();
   }
 }
 
@@ -375,7 +402,8 @@ Status Worker::EnableWriteEvent(int fd) {
     bufferevent_enable(bev, EV_WRITE);
     return Status::OK();
   }
-  return Status(Status::NotOK);
+
+  return {Status::NotOK, "connection doesn't exist"};
 }
 
 Status Worker::Reply(int fd, const std::string &reply) {
@@ -383,64 +411,75 @@ Status Worker::Reply(int fd, const std::string &reply) {
   auto iter = conns_.find(fd);
   if (iter != conns_.end()) {
     iter->second->SetLastInteraction();
-    Redis::Reply(iter->second->Output(), reply);
+    redis::Reply(iter->second->Output(), reply);
     return Status::OK();
   }
-  return Status(Status::NotOK, "connection doesn't exist");
+
+  return {Status::NotOK, "connection doesn't exist"};
 }
 
-void Worker::BecomeMonitorConn(Redis::Connection *conn) {
+void Worker::BecomeMonitorConn(redis::Connection *conn) {
   {
     std::lock_guard<std::mutex> guard(conns_mu_);
     conns_.erase(conn->GetFD());
     monitor_conns_[conn->GetFD()] = conn;
   }
-  svr_->IncrMonitorClientNum();
-  conn->EnableFlag(Redis::Connection::kMonitor);
+  svr->IncrMonitorClientNum();
+  conn->EnableFlag(redis::Connection::kMonitor);
 }
 
-void Worker::FeedMonitorConns(Redis::Connection *conn, const std::vector<std::string> &tokens) {
-  auto now = Util::GetTimeStampUS();
+void Worker::FeedMonitorConns(redis::Connection *conn, const std::vector<std::string> &tokens) {
+  auto now = util::GetTimeStampUS();
+
   std::string output;
   output += std::to_string(now / 1000000) + "." + std::to_string(now % 1000000);
   output += " [" + conn->GetNamespace() + " " + conn->GetAddr() + "]";
   for (const auto &token : tokens) {
     output += " \"" + token + "\"";
   }
+
   std::unique_lock<std::mutex> lock(conns_mu_);
+
   for (const auto &iter : monitor_conns_) {
     if (conn == iter.second) continue;  // skip the monitor command
+
     if (conn->GetNamespace() == iter.second->GetNamespace() || iter.second->GetNamespace() == kDefaultNamespace) {
-      iter.second->Reply(Redis::SimpleString(output));
+      iter.second->Reply(redis::SimpleString(output));
     }
   }
 }
 
 std::string Worker::GetClientsStr() {
   std::unique_lock<std::mutex> lock(conns_mu_);
+
   std::string output;
   for (const auto &iter : conns_) {
-    Redis::Connection *conn = iter.second;
+    redis::Connection *conn = iter.second;
     output.append(conn->ToString());
   }
+
   return output;
 }
 
-void Worker::KillClient(Redis::Connection *self, uint64_t id, const std::string &addr, uint64_t type, bool skipme,
+void Worker::KillClient(redis::Connection *self, uint64_t id, const std::string &addr, uint64_t type, bool skipme,
                         int64_t *killed) {
   std::lock_guard<std::mutex> guard(conns_mu_);
+
   for (const auto &iter : conns_) {
-    Redis::Connection *conn = iter.second;
+    redis::Connection *conn = iter.second;
     if (skipme && self == conn) continue;
-    // no need to kill the client again if flags as kCloseAfterReply
-    if (conn->IsFlagEnabled(Redis::Connection::kCloseAfterReply)) {
+
+    // no need to kill the client again if the kCloseAfterReply flag is set
+    if (conn->IsFlagEnabled(redis::Connection::kCloseAfterReply)) {
       continue;
     }
-    if ((type & conn->GetClientType()) || (!addr.empty() && conn->GetAddr() == addr) ||
+
+    if ((type & conn->GetClientType()) ||
+        (!addr.empty() && (conn->GetAddr() == addr || conn->GetAnnounceAddr() == addr)) ||
         (id != 0 && conn->GetID() == id)) {
-      conn->EnableFlag(Redis::Connection::kCloseAfterReply);
+      conn->EnableFlag(redis::Connection::kCloseAfterReply);
       // enable write event to notify worker wake up ASAP, and remove the connection
-      if (!conn->IsFlagEnabled(Redis::Connection::kSlave)) {  // don't enable any event in slave connection
+      if (!conn->IsFlagEnabled(redis::Connection::kSlave)) {  // don't enable any event in slave connection
         auto bev = conn->GetBufferEvent();
         bufferevent_enable(bev, EV_WRITE);
       }
@@ -450,14 +489,16 @@ void Worker::KillClient(Redis::Connection *self, uint64_t id, const std::string 
 }
 
 void Worker::KickoutIdleClients(int timeout) {
-  std::list<std::pair<int, uint64_t>> to_be_killed_conns;
+  std::vector<std::pair<int, uint64_t>> to_be_killed_conns;
+
   {
     std::lock_guard<std::mutex> guard(conns_mu_);
     if (conns_.empty()) {
       return;
     }
+
     int iterations = std::min(static_cast<int>(conns_.size()), 50);
-    auto iter = conns_.upper_bound(last_iter_conn_fd);
+    auto iter = conns_.upper_bound(last_iter_conn_fd_);
     while (iterations--) {
       if (iter == conns_.end()) iter = conns_.begin();
       if (static_cast<int>(iter->second->GetIdleTime()) >= timeout) {
@@ -466,28 +507,31 @@ void Worker::KickoutIdleClients(int timeout) {
       iter++;
     }
     iter--;
-    last_iter_conn_fd = iter->first;
+    last_iter_conn_fd_ = iter->first;
   }
+
   for (const auto &conn : to_be_killed_conns) {
     FreeConnectionByID(conn.first, conn.second);
   }
 }
 
 void WorkerThread::Start() {
-  try {
-    t_ = std::thread([this]() {
-      Util::ThreadSetName("worker");
-      this->worker_->Run(std::this_thread::get_id());
-    });
-  } catch (const std::system_error &e) {
-    LOG(ERROR) << "[worker] Failed to start worker thread, err: " << e.what();
+  auto s = util::CreateThread("worker", [this] { this->worker_->Run(std::this_thread::get_id()); });
+
+  if (s) {
+    t_ = std::move(*s);
+  } else {
+    LOG(ERROR) << "[worker] Failed to start worker thread, err: " << s.Msg();
     return;
   }
+
   LOG(INFO) << "[worker] Thread #" << t_.get_id() << " started";
 }
 
 void WorkerThread::Stop() { worker_->Stop(); }
 
 void WorkerThread::Join() {
-  if (t_.joinable()) t_.join();
+  if (auto s = util::ThreadJoin(t_); !s) {
+    LOG(WARNING) << "[worker] " << s.Msg();
+  }
 }

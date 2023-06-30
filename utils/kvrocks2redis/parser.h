@@ -35,8 +35,12 @@
 
 class LatestSnapShot {
  public:
-  explicit LatestSnapShot(rocksdb::DB *db) : db_(db) { snapshot_ = db_->GetSnapshot(); }
+  explicit LatestSnapShot(rocksdb::DB *db) : db_(db), snapshot_(db_->GetSnapshot()) {}
   ~LatestSnapShot() { db_->ReleaseSnapshot(snapshot_); }
+
+  LatestSnapShot(const LatestSnapShot &) = delete;
+  LatestSnapShot &operator=(const LatestSnapShot &) = delete;
+
   const rocksdb::Snapshot *GetSnapShot() { return snapshot_; }
 
  private:
@@ -46,22 +50,22 @@ class LatestSnapShot {
 
 class Parser {
  public:
-  explicit Parser(Engine::Storage *storage, Writer *writer) : storage_(storage), writer_(writer) {
-    lastest_snapshot_ = std::unique_ptr<LatestSnapShot>(new LatestSnapShot(storage->GetDB()));
-    is_slotid_encoded_ = storage_->IsSlotIdEncoded();
+  explicit Parser(engine::Storage *storage, Writer *writer)
+      : storage_(storage), writer_(writer), slot_id_encoded_(storage_->IsSlotIdEncoded()) {
+    latest_snapshot_ = std::make_unique<LatestSnapShot>(storage->GetDB());
   }
-  ~Parser() {}
+  ~Parser() = default;
 
   Status ParseFullDB();
-  rocksdb::Status ParseWriteBatch(const std::string &batch_string);
+  Status ParseWriteBatch(const std::string &batch_string);
 
  protected:
-  Engine::Storage *storage_ = nullptr;
+  engine::Storage *storage_ = nullptr;
   Writer *writer_ = nullptr;
-  std::unique_ptr<LatestSnapShot> lastest_snapshot_ = nullptr;
-  bool is_slotid_encoded_ = false;
+  std::unique_ptr<LatestSnapShot> latest_snapshot_;
+  bool slot_id_encoded_ = false;
 
-  Status parseSimpleKV(const Slice &ns_key, const Slice &value, int expire);
+  Status parseSimpleKV(const Slice &ns_key, const Slice &value, uint64_t expire);
   Status parseComplexKV(const Slice &ns_key, const Metadata &metadata);
   Status parseBitmapSegment(const Slice &ns, const Slice &user_key, int index, const Slice &bitmap);
 };

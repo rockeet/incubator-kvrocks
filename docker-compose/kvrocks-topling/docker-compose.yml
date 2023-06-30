@@ -1,0 +1,22 @@
+version: '3'
+services:
+  kvrocks-topling:
+    image: wactax/kvrocks-topling:nightly
+    restart: always
+    container_name: kvrocks-topling
+    mem_limit: 1G
+    memswap_limit: -1
+    environment:
+      kvrocks_port: 51002
+      kvrocks_workers: 6
+      kvrocks_rocksdb_compression: zstd
+      kvrocks_timeout: 360
+      kvrocks_rocksdb_enable_blob_files: "yes"
+      kvrocks_read_options_async_io: "yes"
+      kvrocks_dir: /data
+      kvrocks_log_dir: /log
+    volumes:
+      - /tmp/benchmark/kvrocks-topling/data:/data
+      - /tmp/benchmark/kvrocks-topling/log:/log
+    ports:
+      - 51002:51002

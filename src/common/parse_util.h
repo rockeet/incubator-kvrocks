@@ -26,6 +26,7 @@
 #include <tuple>
 
 #include "status.h"
+#include "string_util.h"
 
 namespace details {
 
@@ -85,7 +86,7 @@ using ParseResultAndPos = std::tuple<T, const char *>;
 // base can be in {0, 2, ..., 36}, refer to strto* in standard c for more details
 template <typename T = long long>  // NOLINT
 StatusOr<ParseResultAndPos<T>> TryParseInt(const char *v, int base = 0) {
-  char *end;
+  char *end = nullptr;
 
   errno = 0;
   auto res = details::ParseIntFunc<T>::value(v, &end, base);
@@ -95,7 +96,7 @@ StatusOr<ParseResultAndPos<T>> TryParseInt(const char *v, int base = 0) {
   }
 
   if (errno) {
-    return {Status::NotOK, std::strerror(errno)};
+    return Status::FromErrno();
   }
 
   if (!std::is_same<T, decltype(res)>::value &&
@@ -139,4 +140,58 @@ StatusOr<T> ParseInt(const std::string &v, NumericRange<T> range, int base = 0) 
   }
 
   return *res;
+}
+
+// available units: K, M, G, T, P
+StatusOr<std::uint64_t> ParseSizeAndUnit(const std::string &v);
+
+template <typename>
+struct ParseFloatFunc;
+
+template <>
+struct ParseFloatFunc<float> {
+  constexpr static const auto value = strtof;
+};
+
+template <>
+struct ParseFloatFunc<double> {
+  constexpr static const auto value = strtod;
+};
+
+template <>
+struct ParseFloatFunc<long double> {
+  constexpr static const auto value = strtold;
+};
+
+// TryParseFloat parses a string to a floating-point number,
+// it returns the first unmatched character position instead of an error status
+template <typename T = double>  // float or double
+StatusOr<ParseResultAndPos<T>> TryParseFloat(const char *str) {
+  char *end = nullptr;
+
+  errno = 0;
+  T result = ParseFloatFunc<T>::value(str, &end);
+
+  if (str == end) {
+    return {Status::NotOK, "not started as a number"};
+  }
+
+  if (errno) {
+    return Status::FromErrno();
+  }
+
+  return {result, end};
+}
+
+// ParseFloat parses a string to a floating-point number
+template <typename T = double>  // float or double
+StatusOr<T> ParseFloat(const std::string &str) {
+  const char *begin = str.c_str();
+  auto [result, pos] = GET_OR_RET(TryParseFloat<T>(begin));
+
+  if (pos != begin + str.size()) {
+    return {Status::NotOK, "encounter non-number characters"};
+  }
+
+  return result;
 }

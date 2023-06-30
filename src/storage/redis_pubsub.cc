@@ -20,10 +20,12 @@
 
 #include "redis_pubsub.h"
 
-namespace Redis {
+namespace redis {
+
 rocksdb::Status PubSub::Publish(const Slice &channel, const Slice &value) {
-  rocksdb::WriteBatch batch;
-  batch.Put(pubsub_cf_handle_, channel, value);
-  return storage_->Write(storage_->DefaultWriteOptions(), &batch);
+  auto batch = storage_->GetWriteBatchBase();
+  batch->Put(pubsub_cf_handle_, channel, value);
+  return storage_->Write(storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
-}  // namespace Redis
+
+}  // namespace redis

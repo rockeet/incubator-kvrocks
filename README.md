@@ -16,6 +16,64 @@
  specific language governing permissions and limitations
  under the License.
 -->
+# ToplingDB support for kvrocks
+[ToplingDB](https://github.com/topling/toplingdb) is compatible with RocksDB and provide higher performance, [WebView](https://github.com/topling/rockside/wiki/WebView), native support to prometheus, secondary instance on shared storage ...
+
+ToplingDB distributed compaction can not be supported since kvrocks CompactionFilter need to access DB and calling DB::Get.
+
+## 1. Build with ToplingDB
+By default ToplingDB is not enabled, to compile kvrocks with ToplingDB, following instructions below:
+
+## 1.1 Build ToplingDB
+```bash
+git clone https://github.com/topling/toplingdb
+cd toplingdb
+make -j`nproc` DEBUG_LEVEL=0 INSTALL_LIBDIR=/path/to/toplingdb/lib install
+```
+
+## 1.2 Build kvrocks with ToplingDB
+```bash
+# build with ToplingDB, you should build and install ToplingDB first
+env TOPLINGDB_HOME=/path/to/toplingdb-repo TOPLINGDB_LIBDIR=/path/to/toplingdb/lib \
+    ./x.py build -j`nproc` -DCMAKE_BUILD_TYPE=Release
+
+# copy html files to kvrocks's ToplingDB document root, this makes webview pretty
+cp /path/to/toplingdb-repo/sideplugin/rockside/src/topling/web/{index.html,style.css} \
+   /path/to/kvrocks/toplingdb/document-root
+```
+
+## 2. Run with ToplingDB
+env var `TOPLING_CONF` specifies ToplingDB json/yaml config which instructs kvrocks to run with ToplingDB.
+
+If env var `TOPLING_CONF` is not specified, kvrocks will run without ToplingDB sideplugin and WebView...
+
+User should change datadir in json config.
+
+```bash
+$ env TOPLING_CONF=kvtopling-community.json ./build/kvrocks -c kvrocks.conf
+```
+
+When run with ToplingDB, RocksDB options(rocksdb.*) in `kvrocks.conf` are ignored.
+
+## 3. Run with ToplingDB shared storage secondary instance
+Secondary instance on shared storage sharing same files of primary instance and keep catch up with primary.
+
+```bash
+$ env TOPLING_CONF=kvtopling-community-2nd.json ./build/kvrocks -c kvrocks.conf
+```
+
+## 4. ToplingDB config files
+
+Primary Node | Secondary Node | ToplingZipTable
+-------------|-------|------
+[kvtopling-community.json](kvtopling-community.json)|[kvtopling-community-2nd.json](kvtopling-community-2nd.json)| No
+[kvtopling-enterprise.json](kvtopling-enterprise.json)|[kvtopling-enterprise-2nd.json](kvtopling-enterprise-2nd.json)|Yes
+
+Databases created by community version can be smoothly upgraded to enterprise version.
+
+---
+---
+---
 
 <img src="https://kvrocks.apache.org/img/kvrocks-featured.png" alt="kvrocks_logo" width="350"/>
 
@@ -28,23 +86,23 @@
 * [Slack Channel](https://join.slack.com/t/kvrockscommunity/shared_invite/zt-p5928e3r-OUAK8SUgC8GOceGM6dAz6w)
 * [Mailing List](https://lists.apache.org/list.html?dev@kvrocks.apache.org) ([how to subscribe](https://www.apache.org/foundation/mailinglists.html#subscribing))
 
-**Apache Kvrocks(Incubating)** is a distributed key value NoSQL database that uses RocksDB as storage engine and is compatible with Redis protocol. Kvrocks intends to decrease the cost of memory and increase the capacity while compared to Redis. The design of replication and storage was inspired by `rocksplicator` and `blackwidow`.
+**Apache Kvrocks(Incubating)** is a distributed key value NoSQL database that uses RocksDB as storage engine and is compatible with Redis protocol. Kvrocks intends to decrease the cost of memory and increase the capacity while compared to Redis. The design of replication and storage was inspired by [rocksplicator](https://github.com/pinterest/rocksplicator) and [blackwidow](https://github.com/Qihoo360/blackwidow).
 
 Kvrocks has the following key features:
 
-* Redis protocol, user can use redis client to visit the kvrocks
-* Namespace, similar to redis db but use token per namespace
-* Replication, async replication using binlog like MySQL
-* High Available, supports redis sentinel to failover when master or slave was failed
-* Cluster mode, centralized management but compatible with Redis cluster client access
+* Redis Compatible: Users can access Apache Kvrocks via any Redis client.
+* Namespace: Similar to Redis SELECT but equipped with token per namespace.
+* Replication: Async replication using binlog like MySQL.
+* High Available: Support Redis sentinel to failover when master or slave was failed.
+* Cluster: Centralized management but accessible via any Redis cluster client.
 
 Thanks to designers [Lingyu Tian](https://github.com/tianlingyu1997) and Shili Fan for contributing the logo of Kvrocks.
 
 ## Who uses Kvrocks
 
-Find Kvrocks users at [the Users page](https://kvrocks.apache.org/users/).
+You can find Kvrocks users at [the Users page](https://kvrocks.apache.org/users/).
 
-Users are encouraged to add themselves to the Users page. Send a pull request to add company or organization [information](https://github.com/apache/incubator-kvrocks-website/blob/main/src/components/UserLogos/index.tsx) and [logo](https://github.com/apache/incubator-kvrocks-website/tree/main/static/media/users).
+Users are encouraged to add themselves to the Users page. Either leave a comment on the ["Who is using Kvrocks"](https://github.com/apache/incubator-kvrocks/issues/414) issue, or directly send a pull request to add company or organization [information](https://github.com/apache/incubator-kvrocks-website/blob/main/src/components/UserLogos/index.tsx) and [logo](https://github.com/apache/incubator-kvrocks-website/tree/main/static/media/users).
 
 ## Build and run Kvrocks
 
@@ -73,6 +131,16 @@ It is as simple as:
 ```shell
 $ git clone https://github.com/apache/incubator-kvrocks.git
 $ cd incubator-kvrocks
+
+# build with ToplingDB, you should build and install ToplingDB first
+env TOPLINGDB_HOME=../toplingdb TOPLINGDB_LIBDIR=/path/to/toplingdb/lib \
+    ./x.py build -j`nproc` -DCMAKE_BUILD_TYPE=Release
+
+# copy html files to kvrocks's ToplingDB document root, this makes webview pretty
+cp /path/to/toplingdb-repo/sideplugin/rockside/src/topling/web/{index.html,style.css} \
+   /path/to/kvrocks/toplingdb/document-root
+
+# default build with rocksdb
 $ ./x.py build # `./x.py build -h` to check more options;
                # especially, `./x.py build --ghproxy` will fetch dependencies via ghproxy.com.
 ```
@@ -83,16 +151,17 @@ To build with TLS support, you'll need OpenSSL development libraries (e.g. libss
 $ ./x.py build -DENABLE_OPENSSL=ON
 ```
 
-To build with luaJIT instead of lua for better performance, run:
+To build with lua instead of luaJIT, run:
 
 ```shell
-$ ./x.py build -DUSE_LUAJIT=ON
+$ ./x.py build -DUSE_LUAJIT=OFF
 ```
 
 ### Running Kvrocks
 
 ```shell
-$ ./build/kvrocks -c kvrocks.conf
+# env TOPLING_CONF instructs kvrocks to run with ToplingDB
+$ env TOPLING_CONF=kvtopling-community.json ./build/kvrocks -c kvrocks.conf
 ```
 
 ### Running Kvrocks using Docker
@@ -122,19 +191,16 @@ $ ./x.py test go # run Golang (unit and integration) test cases
 
 ### Supported platforms
 
-* Linux distributions
-  * CentOS
-  * Ubuntu
-  * and most other distros
+* Linux
 * macOS
 
-##  Namespace
+## Namespace
 
-Namespace is used to isolate data between users. Unlike all the Redis databases can be visited by `requirepass`, we use one token per namespace. `requirepass` is regraded as admin token, and only admin token allows to access the namespace command, as well as some commands like `config`, `slaveof`, `bgsave`, etc..
+Namespace is used to isolate data between users. Unlike all the Redis databases can be visited by `requirepass`, we use one token per namespace. `requirepass` is regraded as admin token, and only admin token allows to access the namespace command, as well as some commands like `config`, `slaveof`, `bgsave`, etc. See the [Namespace](https://kvrocks.apache.org/docs/namespace) page for more details.
 
 ```
 # add token
-127.0.0.1:6666>  namespace add ns1 my_token
+127.0.0.1:6666> namespace add ns1 my_token
 OK
 
 # update token
@@ -168,8 +234,12 @@ Documents are hosted at the [official website](https://kvrocks.apache.org/docs/g
 ## Tools
 
 * Export the Kvrocks monitor metrics, please use [kvrocks_exporter](https://github.com/KvrocksLabs/kvrocks_exporter)
-* Migrate from redis to kvrocks, use [redis-migrate-tool](https://github.com/vipshop/redis-migrate-tool) which was developed by @vipshop
-* Migrate from kvrocks to redis. use `kvrocks2redis` in build dir
+* Migrate from redis to kvrocks, use [redis-migrate-tool](https://github.com/vipshop/redis-migrate-tool) which was developed by [vipshop](https://github.com/vipshop)
+* Migrate from kvrocks to redis, use `kvrocks2redis` in the build directory
+
+## Contributing
+
+Kvrocks community welcomes all forms of contribution and you can find out how to get involved on the [Community](https://kvrocks.apache.org/community/) and [How to Contribute](https://kvrocks.apache.org/community/contributing) pages.
 
 ## Performance
 
@@ -180,7 +250,7 @@ Documents are hosted at the [official website](https://kvrocks.apache.org/docs/g
 * NET:  Intel Corporation I350 Gigabit Network Connection
 * DISK: 2TB NVMe Intel SSD DC P4600
 
->  Benchmark Client:  multi-thread redis-benchmark(unstable branch)
+> Benchmark Client: multi-thread redis-benchmark(unstable branch)
 
 ### 1. Commands QPS
 
@@ -190,7 +260,7 @@ latency: 99.9% < 10ms
 
 ![image](assets/chart-commands.png)
 
-### 2.  QPS on different payloads
+### 2. QPS on different payloads
 
 > kvrocks: workers = 16, benchmark: 8 threads/ 512 conns
 
@@ -198,7 +268,7 @@ latency: 99.9% < 10ms
 
 ![image](assets/chart-values.png)
 
-#### 3. QPS on different workers
+### 3. QPS on different workers
 
 > kvrocks: workers = 16, benchmark: 8 threads/ 512 conns / 128 payload
 

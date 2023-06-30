@@ -25,9 +25,14 @@
 #include <string>
 #include <utility>
 
+#include "time_util.h"
 #include "types/redis_bitmap.h"
+#ifdef KVROCKS_USE_TOPLINGDB
+#include <topling/side_plugin_factory.h>
+#endif
 
-namespace Engine {
+namespace engine {
+
 using rocksdb::Slice;
 
 bool MetadataFilter::Filter(int level, const Slice &key, const Slice &value, std::string *new_value,
@@ -53,7 +58,7 @@ Status SubKeyFilter::GetMetadata(const InternalKey &ikey, Metadata *metadata) co
   auto db = stor_->GetDB();
   const auto cf_handles = stor_->GetCFHandles();
   // storage close the would delete the column family handler and DB
-  if (!db || cf_handles->size() < 2) return Status(Status::NotOK, "storage is closed");
+  if (!db || cf_handles->size() < 2) return {Status::NotOK, "storage is closed"};
   ComposeNamespaceKey(ikey.GetNamespace(), ikey.GetKey(), &metadata_key, stor_->IsSlotIdEncoded());
 
   if (cached_key_.empty() || metadata_key != cached_key_) {
@@ -66,31 +71,33 @@ Status SubKeyFilter::GetMetadata(const InternalKey &ikey, Metadata *metadata) co
       // metadata was deleted(perhaps compaction or manual)
       // clear the metadata
       cached_metadata_.clear();
-      return Status(Status::NotFound, "metadata is not found");
+      return {Status::NotFound, "metadata is not found"};
     } else {
       cached_key_.clear();
       cached_metadata_.clear();
-      return Status(Status::NotOK, "fetch error: " + s.ToString());
+      return {Status::NotOK, "fetch error: " + s.ToString()};
     }
   }
   // the metadata was not found
-  if (cached_metadata_.empty()) return Status(Status::NotFound, "metadata is not found");
+  if (cached_metadata_.empty()) return {Status::NotFound, "metadata is not found"};
   // the metadata is cached
   rocksdb::Status s = metadata->Decode(cached_metadata_);
   if (!s.ok()) {
     cached_key_.clear();
-    return Status(Status::NotOK, "decode error: " + s.ToString());
-    ;
+    return {Status::NotOK, "decode error: " + s.ToString()};
   }
   return Status::OK();
 }
 
-bool SubKeyFilter::IsMetadataExpired(const InternalKey &ikey, const Metadata &metadata) const {
-  if (metadata.Type() == kRedisString  // metadata key was overwrite by set command
-      || metadata.Expired() || ikey.GetVersion() != metadata.version) {
-    return true;
-  }
-  return false;
+bool SubKeyFilter::IsMetadataExpired(const InternalKey &ikey, const Metadata &metadata) {
+  // lazy delete to avoid race condition between command Expire and subkey Compaction
+  // Related issue:https://github.com/apache/incubator-kvrocks/issues/1298
+  //
+  // `Util::GetTimeStampMS() - 300000` means extending 5 minutes for expired items,
+  // to prevent them from being recycled once they reach the expiration time.
+  uint64_t lazy_expired_ts = util::GetTimeStampMS() - 300000;
+  return metadata.Type() == kRedisString  // metadata key was overwrite by set command
+         || metadata.ExpireAt(lazy_expired_ts) || ikey.GetVersion() != metadata.version;
 }
 
 rocksdb::CompactionFilter::Decision SubKeyFilter::FilterBlobByKey(int level, const Slice &key, std::string *new_value,
@@ -131,7 +138,17 @@ bool SubKeyFilter::Filter(int level, const Slice &key, const Slice &value, std::
     return false;
   }
 
-  return IsMetadataExpired(ikey, metadata) || (metadata.Type() == kRedisBitmap && Redis::Bitmap::IsEmptySegment(value));
+  return IsMetadataExpired(ikey, metadata) || (metadata.Type() == kRedisBitmap && redis::Bitmap::IsEmptySegment(value));
 }
 
-}  // namespace Engine
+}  // namespace engine
+
+#ifdef KVROCKS_USE_TOPLINGDB
+namespace rocksdb {
+using namespace engine;
+// ROCKSDB_REG_Plugin(MetadataFilterFactory , CompactionFilterFactory);
+// ROCKSDB_REG_Plugin(SubKeyFilterFactory   , CompactionFilterFactory);
+ROCKSDB_REG_Plugin(PropagateFilterFactory, CompactionFilterFactory);
+ROCKSDB_REG_Plugin(PubSubFilterFactory, CompactionFilterFactory);
+}  // namespace rocksdb
+#endif

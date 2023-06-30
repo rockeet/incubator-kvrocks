@@ -20,9 +20,10 @@
 
 #include "thread_util.h"
 
+#include <fmt/std.h>
 #include <pthread.h>
 
-namespace Util {
+namespace util {
 
 void ThreadSetName(const char *name) {
 #ifdef __APPLE__
@@ -32,4 +33,19 @@ void ThreadSetName(const char *name) {
 #endif
 }
 
-}  // namespace Util
+template <void (std::thread::*F)(), typename... Args>
+Status ThreadOperationImpl(std::thread &t, const char *op, Args &&...args) {
+  try {
+    (t.*F)(std::forward<Args>(args)...);
+  } catch (const std::system_error &e) {
+    return {Status::NotOK, fmt::format("thread #{} cannot be `{}`ed: {}", t.get_id(), op, e.what())};
+  }
+
+  return Status::OK();
+}
+
+Status ThreadJoin(std::thread &t) { return ThreadOperationImpl<&std::thread::join>(t, "join"); }
+
+Status ThreadDetach(std::thread &t) { return ThreadOperationImpl<&std::thread::detach>(t, "detach"); }
+
+}  // namespace util

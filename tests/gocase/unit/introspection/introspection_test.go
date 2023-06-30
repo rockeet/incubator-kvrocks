@@ -40,8 +40,31 @@ func TestIntrospection(t *testing.T) {
 	rdb := srv.NewClient()
 	defer func() { require.NoError(t, rdb.Close()) }()
 
+	t.Run("TIME", func(t *testing.T) {
+		nowUnix := int(time.Now().Unix())
+
+		r := rdb.Do(ctx, "TIME")
+		vs, err := r.Slice()
+		require.NoError(t, err)
+
+		s, err := strconv.Atoi(vs[0].(string))
+		require.NoError(t, err)
+		require.Greater(t, s, nowUnix-2)
+		require.Less(t, s, nowUnix+2)
+
+		us, err := strconv.Atoi(vs[1].(string))
+		require.NoError(t, err)
+		require.Greater(t, us, 0)
+		require.Less(t, us, 1000000)
+	})
+
 	t.Run("CLIENT LIST", func(t *testing.T) {
 		v := rdb.ClientList(ctx).Val()
+		require.Regexp(t, "id=.* addr=.*:.* fd=.* name=.* age=.* idle=.* flags=N namespace=.* qbuf=.* .*obuf=.* cmd=client.*", v)
+	})
+
+	t.Run("CLIENT INFO", func(t *testing.T) {
+		v := rdb.Do(ctx, "CLIENT", "INFO").Val()
 		require.Regexp(t, "id=.* addr=.*:.* fd=.* name=.* age=.* idle=.* flags=N namespace=.* qbuf=.* .*obuf=.* cmd=client.*", v)
 	})
 
@@ -62,6 +85,10 @@ func TestIntrospection(t *testing.T) {
 
 	t.Run("CLIENT LIST shows empty fields for unassigned names", func(t *testing.T) {
 		require.Regexp(t, ".*name= .*", rdb.ClientList(ctx).Val())
+	})
+
+	t.Run("CLIENT INFO shows empty fields for unassigned names", func(t *testing.T) {
+		require.Regexp(t, ".*name= .*", rdb.Do(ctx, "CLIENT", "INFO").Val())
 	})
 
 	t.Run("CLIENT SETNAME does not accept spaces", func(t *testing.T) {

@@ -20,16 +20,16 @@
 
 #include "slot_import.h"
 
-SlotImport::SlotImport(Server *svr) : Database(svr->storage_, kDefaultNamespace), svr_(svr) {
+SlotImport::SlotImport(Server *svr)
+    : Database(svr->storage, kDefaultNamespace),
+      svr_(svr),
+      import_slot_(-1),
+      import_status_(kImportNone),
+      import_fd_(-1) {
   std::lock_guard<std::mutex> guard(mutex_);
-  // Let db_ and metadata_cf_handle_ be nullptr, then get them in real time while use them.
-  // See comments in SlotMigrate::SlotMigrate for detailed reason.
-  db_ = nullptr;
+  // Let metadata_cf_handle_ be nullptr, then get them in real time while use them.
+  // See comments in SlotMigrator::SlotMigrator for detailed reason.
   metadata_cf_handle_ = nullptr;
-
-  import_fd_ = -1;
-  import_slot_ = -1;
-  import_status_ = kImportNone;
 }
 
 bool SlotImport::Start(int fd, int slot) {
@@ -51,6 +51,7 @@ bool SlotImport::Start(int fd, int slot) {
   import_status_ = kImportStart;
   import_slot_ = slot;
   import_fd_ = fd;
+
   return true;
 }
 
@@ -61,7 +62,7 @@ bool SlotImport::Success(int slot) {
     return false;
   }
 
-  Status s = svr_->cluster_->SetSlotImported(import_slot_);
+  Status s = svr_->cluster->SetSlotImported(import_slot_);
   if (!s.IsOK()) {
     LOG(ERROR) << "[import] Failed to set slot, Err: " << s.Msg();
     return false;
@@ -69,6 +70,7 @@ bool SlotImport::Success(int slot) {
 
   import_status_ = kImportSuccess;
   import_fd_ = -1;
+
   return true;
 }
 
@@ -88,6 +90,7 @@ bool SlotImport::Fail(int slot) {
 
   import_status_ = kImportFailed;
   import_fd_ = -1;
+
   return true;
 }
 
@@ -97,7 +100,7 @@ void SlotImport::StopForLinkError(int fd) {
 
   // Maybe server has failovered
   // Situation:
-  // Refer to the situation described in SlotMigrate::SlotMigrate
+  // Refer to the situation described in SlotMigrator::SlotMigrator
   // 1. Change server to slave when it is importing data.
   // 2. Source server's migration process end after destination server has finished replication.
   // 3. The migration link closed by source server, then this function will be call by OnEvent.

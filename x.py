@@ -25,8 +25,6 @@ import re
 from subprocess import Popen, PIPE
 import sys
 from typing import List, Any, Optional, TextIO, Tuple
-from shutil import copyfile
-from warnings import warn
 
 CMAKE_REQUIRE_VERSION = (3, 16, 0)
 CLANG_FORMAT_REQUIRED_VERSION = (12, 0, 0)
@@ -136,14 +134,14 @@ def build(dir: str, jobs: Optional[int], ghproxy: bool, ninja: bool, unittest: b
     run(cmake, *options, verbose=True, cwd=dir)
 
 
-def get_source_files() -> List[str]:
+def get_source_files(dir: Path) -> List[str]:
     return [
-        *glob("src/**/*.h", recursive=True),
-        *glob("src/**/*.cc", recursive=True),
-        *glob("tests/cppunit/**/*.h", recursive=True),
-        *glob("tests/cppunit/**/*.cc", recursive=True),
-        *glob("utils/kvrocks2redis/**/*.h", recursive=True),
-        *glob("utils/kvrocks2redis/**/*.cc", recursive=True),
+        *glob(str(dir / "src/**/*.h"), recursive=True),
+        *glob(str(dir / "src/**/*.cc"), recursive=True),
+        *glob(str(dir / "tests/cppunit/**/*.h"), recursive=True),
+        *glob(str(dir / "tests/cppunit/**/*.cc"), recursive=True),
+        *glob(str(dir / "utils/kvrocks2redis/**/*.h"), recursive=True),
+        *glob(str(dir / "utils/kvrocks2redis/**/*.cc"), recursive=True),
     ]
 
 
@@ -153,16 +151,10 @@ def clang_format(clang_format_path: str, fix: bool = False) -> None:
     version_res = run_pipe(command, '--version').read().strip()
     version_str = re.search(r'version\s+((?:\w|\.)+)', version_res).group(1)
 
-    version = check_version(version_str, CLANG_FORMAT_REQUIRED_VERSION, "clang-format")
-
-    if version[0] > 12:
-        warn("We use clang-format 12 in CI, "
-             "so we recommend that you also use this version locally to avoid inconsistencies. "
-             "You can install it from your package manager (usually in clang-12 package) "
-             "or download it from https://github.com/llvm/llvm-project/releases/tag/llvmorg-12.0.1")
+    check_version(version_str, CLANG_FORMAT_REQUIRED_VERSION, "clang-format")
 
     basedir = Path(__file__).parent.absolute()
-    sources = get_source_files()
+    sources = get_source_files(basedir)
 
     if fix:
         options = ['-i']
@@ -172,7 +164,7 @@ def clang_format(clang_format_path: str, fix: bool = False) -> None:
     run(command, *options, *sources, verbose=True, cwd=basedir)
 
 
-def clang_tidy(dir: str, jobs: Optional[int], clang_tidy_path: str, run_clang_tidy_path: str) -> None:
+def clang_tidy(dir: str, jobs: Optional[int], clang_tidy_path: str, run_clang_tidy_path: str, fix: bool) -> None:
     # use the run-clang-tidy Python script provided by LLVM Clang
     run_command = find_command(run_clang_tidy_path, msg="run-clang-tidy is required")
     tidy_command = find_command(clang_tidy_path, msg="clang-tidy is required")
@@ -191,7 +183,13 @@ def clang_tidy(dir: str, jobs: Optional[int], clang_tidy_path: str, run_clang_ti
     if jobs is not None:
         options.append(f'-j{jobs}')
 
-    run(run_command, *options, 'kvrocks/src/', verbose=True, cwd=basedir)
+    options.extend(['-fix'] if fix else [])
+
+    regexes = ['kvrocks/src/', 'utils/kvrocks2redis/', 'tests/cppunit/']
+
+    options.append(f'-header-filter={"|".join(regexes)}')
+
+    run(run_command, *options, *regexes, verbose=True, cwd=basedir)
 
 
 def golangci_lint() -> None:
@@ -218,19 +216,22 @@ def write_version(release_version: str) -> str:
     return version
 
 
-def package_source(release_version: str) -> None:
+def package_source(release_version: str, release_candidate_number: Optional[int]) -> None:
     # 0. Write input version to VERSION file
     version = write_version(release_version)
 
     # 1. Git commit and tag
     git = find_command('git', msg='git is required for source packaging')
     run(git, 'commit', '-a', '-m', f'[source-release] prepare release apache-kvrocks-{version}')
-    run(git, 'tag', '-a', f'v{version}', '-m', f'[source-release] copy for tag v{version}')
+    if release_candidate_number is None:
+        run(git, 'tag', '-a', f'v{version}', '-m', f'[source-release] copy for tag v{version}')
+    else:
+        run(git, 'tag', '-a', f'v{version}-rc{release_candidate_number}', '-m', f'[source-release] copy for tag v{version}-rc{release_candidate_number}')
 
-    tarball = f'apache-kvrocks-{version}-incubating-src.tar.gz'
     # 2. Create the source tarball
-    output = run_pipe(git, 'ls-files')
-    run('xargs', 'tar', '-czf', tarball, stdin=output)
+    folder = f'apache-kvrocks-{version}-incubating-src'
+    tarball = f'apache-kvrocks-{version}-incubating-src.tar.gz'
+    run(git, 'archive', '--format=tar.gz', f'--output={tarball}', f'--prefix={folder}/', 'HEAD')
 
     # 3. GPG Sign
     gpg = find_command('gpg', msg='gpg is required for source packaging')
@@ -238,49 +239,8 @@ def package_source(release_version: str) -> None:
 
     # 4. Generate sha512 checksum
     sha512sum = find_command('sha512sum', msg='sha512sum is required for source packaging')
-    output = run_pipe(sha512sum, tarball)
-    payload = output.read().strip()
     with open(f'{tarball}.sha512', 'w+') as f:
-        f.write(payload)
-
-
-def package_fpm(package_type: str, release_version: str, dir: str, jobs: Optional[int]) -> None:
-    fpm = find_command('fpm', msg=f'fpm is required for {package_type} packaging')
-
-    version = write_version(release_version)
-
-    build(dir=dir, jobs=jobs, ghproxy=False, ninja=False, unittest=False, skip_build=False, compiler='auto',
-          cmake_path='cmake', D=[])
-
-    package_dir = Path(dir) / 'package-fpm'
-    makedirs(str(package_dir), exist_ok=False)
-    makedirs(str(package_dir / 'bin'))
-    makedirs(str(package_dir / 'conf'))
-
-    basedir = Path(__file__).parent.absolute()
-
-    copyfile(str(Path(dir) / 'kvrocks'), str(package_dir / 'bin' / 'kvrocks'))
-    copyfile(str(Path(dir) / 'kvrocks2redis'), str(package_dir / 'bin' / 'kvrocks2redis'))
-    copyfile(str(basedir / 'kvrocks.conf'), str(package_dir / 'conf' / 'kvrocks.conf'))
-
-    fpm_opts = [
-        '-t', package_type,
-        '-v', version,
-        '-C', str(package_dir),
-        '-s', 'dir',
-        '--prefix', '/www/kvrocks',
-        '-n', 'kvrocks',
-        '--epoch', '7',
-        '--config-files', '/www/kvrocks/conf/kvrocks.conf',
-        '--iteration', 'release',
-        '--verbose',
-        '--category', 'kvrocks/projects',
-        '--description', 'kvrocks',
-        '--url', 'https://github.com/apache/incubator-kvrocks',
-        '--license', 'Apache-2.0'
-    ]
-
-    run(fpm, *fpm_opts, verbose=True)
+        run(sha512sum, tarball, stdout=f)
 
 
 def test_cpp(dir: str, rest: List[str]) -> None:
@@ -299,7 +259,7 @@ def test_go(dir: str, cli_path: str, rest: List[str]) -> None:
     workspace = basedir / 'workspace'
 
     args = [
-        'test', '-bench=.', './...',
+        'test', '-timeout=1800s', '-bench=.', './...',
         f'-binPath={binpath}',
         f'-cliPath={cli_path}',
         f'-workspace={workspace}',
@@ -350,6 +310,8 @@ if __name__ == '__main__':
                                    help="path of clang-tidy used to check source")
     parser_check_tidy.add_argument('--run-clang-tidy-path', default='run-clang-tidy',
                                    help="path of run-clang-tidy used to check source")
+    parser_check_tidy.add_argument('--fix', default=False, action='store_true',
+                              help='automatically fix codebase via clang-tidy suggested changes')
     parser_check_golangci_lint = parser_check_subparsers.add_parser(
         'golangci-lint',
         description="Check code with golangci-lint (https://golangci-lint.run/)",
@@ -374,7 +336,7 @@ if __name__ == '__main__':
     parser_build.add_argument('--compiler', default='auto', choices=('auto', 'gcc', 'clang'),
                               help="compiler used to build kvrocks")
     parser_build.add_argument('--cmake-path', default='cmake', help="path of cmake binary used to build kvrocks")
-    parser_build.add_argument('-D', nargs='*', metavar='key=value', help='extra CMake definitions')
+    parser_build.add_argument('-D', action='append', metavar='key=value', help='extra CMake definitions')
     parser_build.add_argument('--skip-build', default=False, action='store_true',
                               help='runs only the configure stage, skip the build stage')
     parser_build.set_defaults(func=build)
@@ -394,20 +356,8 @@ if __name__ == '__main__':
     )
     parser_package_source.add_argument('-v', '--release-version', required=True, metavar='VERSION',
                                        help='current releasing version')
+    parser_package_source.add_argument('-rc', '--release-candidate-number',required=False, type=int, help='current releasing candidate number')
     parser_package_source.set_defaults(func=package_source)
-    parser_package_fpm = parser_package_subparsers.add_parser(
-        'fpm',
-        description="Package built binaries to an rpm/deb package",
-        help="Package built binaries to an rpm/deb package",
-    )
-    parser_package_fpm.add_argument('-v', '--release-version', required=True, metavar='VERSION',
-                                    help='current releasing version')
-    parser_package_fpm.add_argument('-t', '--package-type', required=True, choices=('rpm', 'deb'),
-                                    help='package type for fpm to build')
-    parser_package_fpm.add_argument('dir', metavar='BUILD_DIR',
-                                    help="directory to store cmake-generated and build files")
-    parser_package_fpm.add_argument('-j', '--jobs', metavar='N', help='execute N build jobs concurrently')
-    parser_package_fpm.set_defaults(func=package_fpm)
 
     parser_test = subparsers.add_parser(
         'test',

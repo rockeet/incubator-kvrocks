@@ -37,10 +37,11 @@ enum ImportStatus {
   kImportNone,
 };
 
-class SlotImport : public Redis::Database {
+class SlotImport : public redis::Database {
  public:
   explicit SlotImport(Server *svr);
   ~SlotImport() = default;
+
   bool Start(int fd, int slot);
   bool Success(int slot);
   bool Fail(int slot);

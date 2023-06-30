@@ -1,24 +1,4 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- *
- */
-
-/*
  * Copyright (c) 2013-2014, yinqiwen <yinqiwen@gmail.com>
  * Copyright (c) 2014, Matt Stancliff <matt@genges.com>.
  * Copyright (c) 2015, Salvatore Sanfilippo <antirez@gmail.com>.
@@ -115,7 +95,7 @@ struct GeoHashRadius {
 };
 
 inline constexpr bool HASHISZERO(const GeoHashBits &r) { return !r.bits && !r.step; }
-inline constexpr bool RANGEISZERO(const GeoHashRange &r) { return !r.max && !r.min; }
+inline constexpr bool RANGEISZERO(const GeoHashRange &r) { return !bool(r.max) && !bool(r.min); }
 inline constexpr bool RANGEPISZERO(const GeoHashRange *r) { return !r || RANGEISZERO(*r); }
 
 inline constexpr void GZERO(GeoHashBits &s) { s.bits = s.step = 0; }
@@ -126,18 +106,18 @@ inline constexpr bool GISNOTZERO(const GeoHashBits &s) { return (s.bits || s.ste
  * 0:success
  * -1:failed
  */
-void geohashGetCoordRange(GeoHashRange *long_range, GeoHashRange *lat_range);
-int geohashEncode(const GeoHashRange *long_range, const GeoHashRange *lat_range, double longitude, double latitude,
+void GeohashGetCoordRange(GeoHashRange *long_range, GeoHashRange *lat_range);
+int GeohashEncode(const GeoHashRange *long_range, const GeoHashRange *lat_range, double longitude, double latitude,
                   uint8_t step, GeoHashBits *hash);
-int geohashEncodeType(double longitude, double latitude, uint8_t step, GeoHashBits *hash);
-int geohashEncodeWGS84(double longitude, double latitude, uint8_t step, GeoHashBits *hash);
-int geohashDecode(const GeoHashRange &long_range, const GeoHashRange &lat_range, const GeoHashBits &hash,
+int GeohashEncodeType(double longitude, double latitude, uint8_t step, GeoHashBits *hash);
+int GeohashEncodeWGS84(double longitude, double latitude, uint8_t step, GeoHashBits *hash);
+int GeohashDecode(const GeoHashRange &long_range, const GeoHashRange &lat_range, const GeoHashBits &hash,
                   GeoHashArea *area);
-int geohashDecodeType(const GeoHashBits &hash, GeoHashArea *area);
-int geohashDecodeAreaToLongLat(const GeoHashArea *area, double *xy);
-int geohashDecodeToLongLatType(const GeoHashBits &hash, double *xy);
-int geohashDecodeToLongLatWGS84(const GeoHashBits &hash, double *xy);
-void geohashNeighbors(const GeoHashBits *hash, GeoHashNeighbors *neighbors);
+int GeohashDecodeType(const GeoHashBits &hash, GeoHashArea *area);
+int GeohashDecodeAreaToLongLat(const GeoHashArea *area, double *xy);
+int GeohashDecodeToLongLatType(const GeoHashBits &hash, double *xy);
+int GeohashDecodeToLongLatWGS84(const GeoHashBits &hash, double *xy);
+void GeohashNeighbors(const GeoHashBits *hash, GeoHashNeighbors *neighbors);
 
 class GeoHashHelper {
  public:

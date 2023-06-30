@@ -47,30 +47,30 @@ static const uint16_t crc16tab[256] = {
     0x1ce0, 0x0cc1, 0xef1f, 0xff3e, 0xcf5d, 0xdf7c, 0xaf9b, 0xbfba, 0x8fd9, 0x9ff8, 0x6e17, 0x7e36, 0x4e55, 0x5e74,
     0x2e93, 0x3eb2, 0x0ed1, 0x1ef0};
 
-uint16_t crc16(const char *buf, int len) {
-  int i = 0;
+uint16_t Crc16(const char *buf, size_t len) {
   uint16_t crc = 0;
-  for (i = 0; i < len; i++) crc = (crc << 8) ^ crc16tab[((crc >> 8) ^ *buf++) & 0x00FF];
+  for (size_t i = 0; i < len; i++) crc = (crc << 8) ^ crc16tab[((crc >> 8) ^ *buf++) & 0x00FF];
   return crc;
 }
 
-uint16_t GetSlotNumFromKey(const std::string &key) {
+uint16_t GetSlotIdFromKey(const std::string &key) {
   auto tag = GetTagFromKey(key);
   if (tag.empty()) {
     tag = key;
   }
 
-  auto crc = crc16(tag.data(), static_cast<int>(tag.size()));
-  return static_cast<int>(crc & HASH_SLOTS_MASK);
+  auto crc = Crc16(tag.data(), tag.size());
+  return crc & HASH_SLOTS_MASK;
 }
 
 std::string GetTagFromKey(const std::string &key) {
   auto left_pos = key.find('{');
-  if (left_pos == std::string::npos) return std::string();
+  if (left_pos == std::string::npos) return {};
+
   auto right_pos = key.find('}', left_pos + 1);
   // Note that we hash the whole key if there is nothing between {}.
   if (right_pos == std::string::npos || right_pos <= left_pos + 1) {
-    return std::string();
+    return {};
   }
 
   return key.substr(left_pos + 1, right_pos - left_pos - 1);

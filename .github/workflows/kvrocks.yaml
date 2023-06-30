@@ -33,9 +33,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  precondition:
+    name: Precondition
+    runs-on: ubuntu-22.04
+    outputs:
+      docs_only: ${{ steps.result.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: .github/config/changes.yml
+          list-files: csv
+      - name: Calculate changes
+        id: result
+        run: |
+          echo "docs_only=${{ fromJSON(steps.changes.outputs.all_count) == fromJSON(steps.changes.outputs.docs_count) && fromJSON(steps.changes.outputs.docs_count) > 0 }}" >> $GITHUB_OUTPUT
+
   check-and-lint:
     name: Lint and check code
-    runs-on: ubuntu-20.04
+    needs: [precondition]
+    if: ${{ needs.precondition.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-go@v3
@@ -44,24 +63,24 @@ jobs:
       - name: Prepare Dependencies
         run: |
           sudo apt update
-          sudo apt install -y clang-format-12 clang-tidy-12
+          sudo apt install -y clang-format-14 clang-tidy-14
       - uses: apache/skywalking-eyes/header@v0.4.0
         with:
           config: .github/config/licenserc.yml
       - name: Check with clang-format
         id: check-format
-        run: ./x.py check format --clang-format-path clang-format-12
+        run: ./x.py check format --clang-format-path clang-format-14
       - name: Check with clang-tidy
         run: |
           ./x.py build --skip-build
-          ./x.py check tidy -j $(nproc) --clang-tidy-path clang-tidy-12 --run-clang-tidy-path run-clang-tidy-12
+          ./x.py check tidy -j $(nproc) --clang-tidy-path clang-tidy-14 --run-clang-tidy-path run-clang-tidy-14
       - name: Lint with golangci-lint
         run: ./x.py check golangci-lint
 
       - name: Prepare format patch
         if: always() && steps.check-format.outcome != 'success'
         run: |
-          ./x.py format --clang-format-path clang-format-12
+          ./x.py format --clang-format-path clang-format-14
           git diff -p > clang-format.patch
           cat clang-format.patch
       - name: Upload format patch
@@ -72,7 +91,8 @@ jobs:
 
   build-and-test:
     name: Build and test
-    needs: [check-and-lint]
+    needs: [precondition, check-and-lint]
+    if: ${{ needs.precondition.outputs.docs_only != 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -80,79 +100,80 @@ jobs:
           - name: Darwin Clang
             os: macos-11
             compiler: auto
-            with_openssl: -DENABLE_OPENSSL=ON
           - name: Darwin Clang without Jemalloc
             os: macos-11
             compiler: auto
             without_jemalloc: -DDISABLE_JEMALLOC=ON
+          - name: Darwin Clang with OpenSSL
+            os: macos-11
+            compiler: auto
             with_openssl: -DENABLE_OPENSSL=ON
+          - name: Darwin Clang without luaJIT
+            os: macos-11
+            compiler: auto
+            without_luajit: -DUSE_LUAJIT=OFF
           - name: Ubuntu GCC
             os: ubuntu-20.04
             compiler: gcc
-            with_openssl: -DENABLE_OPENSSL=ON
           - name: Ubuntu Clang
             os: ubuntu-20.04
             compiler: clang
-            with_openssl: -DENABLE_OPENSSL=ON
+          - name: Ubuntu 22 GCC
+            os: ubuntu-22.04
+            compiler: gcc
+          - name: Ubuntu 22 Clang
+            os: ubuntu-22.04
+            compiler: clang
           - name: Ubuntu GCC ASan
             os: ubuntu-20.04
             without_jemalloc: -DDISABLE_JEMALLOC=ON
             with_sanitizer: -DENABLE_ASAN=ON
-            with_openssl: -DENABLE_OPENSSL=ON
             compiler: gcc
           - name: Ubuntu Clang ASan
             os: ubuntu-20.04
             with_sanitizer: -DENABLE_ASAN=ON
             without_jemalloc: -DDISABLE_JEMALLOC=ON
-            with_openssl: -DENABLE_OPENSSL=ON
             compiler: clang
           - name: Ubuntu GCC TSan
             os: ubuntu-20.04
             without_jemalloc: -DDISABLE_JEMALLOC=ON
-            with_openssl: -DENABLE_OPENSSL=ON
             with_sanitizer: -DENABLE_TSAN=ON
             compiler: gcc
-            runtime_env_vars: TSAN_OPTIONS="suppressions=$(realpath ./tests/tsan-suppressions)"
+            ignore_when_tsan: -tags="ignore_when_tsan"
           - name: Ubuntu Clang TSan
             os: ubuntu-20.04
             with_sanitizer: -DENABLE_TSAN=ON
             without_jemalloc: -DDISABLE_JEMALLOC=ON
-            with_openssl: -DENABLE_OPENSSL=ON
             compiler: clang
-            runtime_env_vars: TSAN_OPTIONS="suppressions=$(realpath ./tests/tsan-suppressions)"
+            ignore_when_tsan: -tags="ignore_when_tsan"
           - name: Ubuntu GCC Ninja
             os: ubuntu-20.04
             with_ninja: --ninja
-            with_openssl: -DENABLE_OPENSSL=ON
             compiler: gcc
-          - name: Ubuntu GCC Ninja without Jemalloc
-            os: ubuntu-20.04
-            with_ninja: --ninja
-            without_jemalloc: -DDISABLE_JEMALLOC=ON
-            with_openssl: -DENABLE_OPENSSL=ON
-            compiler: gcc
-          - name: Ubuntu GCC with luaJIT
-            os: ubuntu-20.04
-            with_openssl: -DENABLE_OPENSSL=ON
-            with_luajit: -DUSE_LUAJIT=ON
-            compiler: gcc
-          - name: Ubuntu GCC ASan with luaJIT
-            os: ubuntu-20.04
-            without_jemalloc: -DDISABLE_JEMALLOC=ON
-            with_luajit: -DUSE_LUAJIT=ON
-            with_sanitizer: -DENABLE_ASAN=ON
-            with_openssl: -DENABLE_OPENSSL=ON
-            compiler: gcc
-          - name: Ubuntu GCC TSan with luaJIT
-            os: ubuntu-20.04
-            without_jemalloc: -DDISABLE_JEMALLOC=ON
-            with_luajit: -DUSE_LUAJIT=ON
-            with_sanitizer: -DENABLE_TSAN=ON
-            with_openssl: -DENABLE_OPENSSL=ON
-            compiler: gcc
-          - name: Ubuntu GCC without OpenSSL
+          - name: Ubuntu GCC with OpenSSL
             os: ubuntu-20.04
             compiler: gcc
+            with_openssl: -DENABLE_OPENSSL=ON
+          - name: Ubuntu Clang with OpenSSL
+            os: ubuntu-20.04
+            compiler: clang
+            with_openssl: -DENABLE_OPENSSL=ON
+          - name: Ubuntu GCC without luaJIT
+            os: ubuntu-20.04
+            without_luajit: -DUSE_LUAJIT=OFF
+            compiler: gcc
+          - name: Ubuntu Clang without luaJIT
+            os: ubuntu-20.04
+            without_luajit: -DUSE_LUAJIT=OFF
+            compiler: clang
+          - name: Ubuntu GCC with new encoding
+            os: ubuntu-20.04
+            compiler: gcc
+            new_encoding: -DENABLE_NEW_ENCODING=TRUE
+          - name: Ubuntu Clang with new encoding
+            os: ubuntu-20.04
+            compiler: clang
+            new_encoding: -DENABLE_NEW_ENCODING=TRUE
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -194,9 +215,9 @@ jobs:
 
       - name: Build Kvrocks
         run: |
-          ./x.py build -j$NPROC --unittest --compiler ${{ matrix.compiler }} ${{ matrix.without_jemalloc }} ${{ matrix.with_luajit }} \
-            ${{ matrix.with_ninja }} ${{ matrix.with_sanitizer }} ${{ matrix.with_openssl }} ${{ env.CMAKE_EXTRA_DEFS }}
-      
+          ./x.py build -j$NPROC --unittest --compiler ${{ matrix.compiler }} ${{ matrix.without_jemalloc }} ${{ matrix.without_luajit }} \
+            ${{ matrix.with_ninja }} ${{ matrix.with_sanitizer }} ${{ matrix.with_openssl }} ${{ matrix.new_encoding }} ${{ env.CMAKE_EXTRA_DEFS }}
+
       - name: Setup Coredump
         if: ${{ startsWith(matrix.os, 'ubuntu') }}
         run: |
@@ -206,13 +227,15 @@ jobs:
       - name: Run Unit Test
         run: |
           ulimit -c unlimited
-          export ${{ matrix.runtime_env_vars }}
+          export LSAN_OPTIONS="suppressions=$(realpath ./tests/lsan-suppressions)"
+          export TSAN_OPTIONS="suppressions=$(realpath ./tests/tsan-suppressions)"
           ./x.py test cpp
 
       - name: Run Go Integration Cases
         run: |
           ulimit -c unlimited
-          export ${{ matrix.runtime_env_vars }}
+          export LSAN_OPTIONS="suppressions=$(realpath ./tests/lsan-suppressions)"
+          export TSAN_OPTIONS="suppressions=$(realpath ./tests/tsan-suppressions)"
           export PATH=$PATH:$HOME/local/bin/
           GOCASE_RUN_ARGS=""
           if [[ -n "${{ matrix.with_openssl }}" ]] && [[ "${{ matrix.os }}" == ubuntu* ]]; then
@@ -224,8 +247,8 @@ jobs:
             cp minica.pem tests/gocase/tls/cert/ca.crt
             GOCASE_RUN_ARGS="-tlsEnable"
           fi
-          ./x.py test go build $GOCASE_RUN_ARGS
-          
+          ./x.py test go build $GOCASE_RUN_ARGS ${{ matrix.ignore_when_tsan}}
+
       - name: Find reports and crashes
         if: always()
         run: |
@@ -254,17 +277,38 @@ jobs:
             ./build/kvrocks
             ./coredumps/*
 
+  check-docker:
+    name: Check Docker image
+    needs: [precondition, check-and-lint]
+    if: ${{ needs.precondition.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v3
+      - name: Get core numbers
+        run: echo "NPROC=$(nproc)" >> $GITHUB_ENV
+      - uses: docker/build-push-action@v3
+        with:
+          context: .
+          build-args: MORE_BUILD_ARGS=-j${{ env.NPROC }}
+
   required:
     if: always()
     name: Required
     runs-on: ubuntu-latest
     needs:
+      - precondition
       - build-and-test
+      - check-docker
     steps:
       - name: Merge requirement checking
+        if: ${{ needs.precondition.outputs.docs_only != 'true' }}
         run: |
-          build_and_test=${{ needs.build-and-test.result }}
-
-          if [[ $build_and_test != 'success' ]]; then
+          if [[ ! ( \
+                   "${{ needs.build-and-test.result }}" == "success" \
+                && "${{ needs.check-docker.result }}" == "success" \
+               ) ]]; then
+            echo "Required jobs haven't been completed successfully."
             exit 1
           fi
+      - name: Sentinel
+        run: true

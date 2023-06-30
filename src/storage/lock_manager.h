@@ -30,9 +30,12 @@
 class LockManager {
  public:
   explicit LockManager(int hash_power);
-  ~LockManager();
+  ~LockManager() = default;
 
-  unsigned Size();
+  LockManager(const LockManager &) = delete;
+  LockManager &operator=(const LockManager &) = delete;
+
+  unsigned Size() const;
   void Lock(const rocksdb::Slice &key);
   void UnLock(const rocksdb::Slice &key);
   std::vector<std::mutex *> MultiGet(const std::vector<std::string> &keys);
@@ -40,8 +43,9 @@ class LockManager {
  private:
   int hash_power_;
   unsigned hash_mask_;
-  std::vector<std::mutex *> mutex_pool_;
-  unsigned hash(const rocksdb::Slice &key);
+  std::vector<std::unique_ptr<std::mutex>> mutex_pool_;
+
+  unsigned hash(const rocksdb::Slice &key) const;
 };
 
 class LockGuard {
@@ -50,6 +54,9 @@ class LockGuard {
     lock_mgr->Lock(key_);
   }
   ~LockGuard() { lock_mgr_->UnLock(key_); }
+
+  LockGuard(const LockGuard &) = delete;
+  LockGuard &operator=(const LockGuard &) = delete;
 
  private:
   LockManager *lock_mgr_ = nullptr;
@@ -71,6 +78,9 @@ class MultiLockGuard {
       (*iter)->unlock();
     }
   }
+
+  MultiLockGuard(const MultiLockGuard &) = delete;
+  MultiLockGuard &operator=(const MultiLockGuard &) = delete;
 
  private:
   LockManager *lock_mgr_ = nullptr;

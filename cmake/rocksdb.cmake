@@ -26,12 +26,13 @@ endif()
 include(cmake/utils.cmake)
 
 FetchContent_DeclareGitHubWithMirror(rocksdb
-  facebook/rocksdb v7.7.3
-  MD5=5b4837735d6205efd1a6e1b8b554ac89
+  facebook/rocksdb v8.1.1
+  MD5=b362246096dbd15839749da37d3ccda9
 )
 
 FetchContent_GetProperties(jemalloc)
 FetchContent_GetProperties(snappy)
+FetchContent_GetProperties(tbb)
 
 FetchContent_MakeAvailableWithArgs(rocksdb
   CMAKE_MODULE_PATH=${PROJECT_SOURCE_DIR}/cmake/modules # to locate FindJeMalloc.cmake
@@ -39,15 +40,19 @@ FetchContent_MakeAvailableWithArgs(rocksdb
   FAIL_ON_WARNINGS=OFF
   WITH_TESTS=OFF
   WITH_BENCHMARK_TOOLS=OFF
+  WITH_CORE_TOOLS=OFF
+  WITH_TOOLS=OFF
   WITH_SNAPPY=ON
   WITH_LZ4=ON
   WITH_ZLIB=ON
   WITH_ZSTD=ON
   WITH_TOOLS=OFF
   WITH_GFLAGS=OFF
+  WITH_TBB=ON
   USE_RTTI=ON
   ROCKSDB_BUILD_SHARED=OFF
   WITH_JEMALLOC=${COMPILE_WITH_JEMALLOC}
+  PORTABLE=${PORTABLE}
 )
 
 add_library(rocksdb_with_headers INTERFACE)

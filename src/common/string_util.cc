@@ -24,9 +24,9 @@
 
 #include "parse_util.h"
 
-namespace Util {
+namespace util {
 
-const std::string Float2String(double d) {
+std::string Float2String(double d) {
   if (std::isinf(d)) {
     return d > 0 ? "inf" : "-inf";
   }
@@ -111,30 +111,29 @@ int StringMatchLen(const char *pattern, size_t pattern_len, const char *string, 
           pattern++;
           pattern_len--;
         }
+
         if (pattern_len == 1) return 1; /* match */
+
         while (string_len) {
           if (StringMatchLen(pattern + 1, pattern_len - 1, string, string_len, nocase)) return 1; /* match */
           string++;
           string_len--;
         }
         return 0; /* no match */
-        break;
       case '?':
-        if (string_len == 0) return 0; /* no match */
         string++;
         string_len--;
         break;
       case '[': {
-        int not_symbol = 0, match = 0;
-
         pattern++;
         pattern_len--;
-        not_symbol = pattern[0] == '^';
+        int not_symbol = pattern[0] == '^';
         if (not_symbol) {
           pattern++;
           pattern_len--;
         }
-        match = 0;
+
+        int match = 0;
         while (true) {
           if (pattern[0] == '\\' && pattern_len >= 2) {
             pattern++;
@@ -173,8 +172,11 @@ int StringMatchLen(const char *pattern, size_t pattern_len, const char *string, 
           pattern++;
           pattern_len--;
         }
+
         if (not_symbol) match = !match;
+
         if (!match) return 0; /* no match */
+
         string++;
         string_len--;
         break;
@@ -205,6 +207,7 @@ int StringMatchLen(const char *pattern, size_t pattern_len, const char *string, 
       break;
     }
   }
+
   if (pattern_len == 0 && string_len == 0) return 1;
   return 0;
 }
@@ -220,23 +223,23 @@ std::string StringToHex(const std::string &input) {
   return output;
 }
 
-constexpr unsigned long long expTo1024(unsigned n) { return 1ULL << (n * 10); }
+constexpr unsigned long long ExpTo1024(unsigned n) { return 1ULL << (n * 10); }
 
-void BytesToHuman(char *buf, size_t size, uint64_t n) {
-  if (n < expTo1024(1)) {
-    fmt::format_to_n(buf, size, "{}B", n);
-  } else if (n < expTo1024(2)) {
-    fmt::format_to_n(buf, size, "{:.2f}K", static_cast<double>(n) / expTo1024(1));
-  } else if (n < expTo1024(3)) {
-    fmt::format_to_n(buf, size, "{:.2f}M", static_cast<double>(n) / expTo1024(2));
-  } else if (n < expTo1024(4)) {
-    fmt::format_to_n(buf, size, "{:.2f}G", static_cast<double>(n) / expTo1024(3));
-  } else if (n < expTo1024(5)) {
-    fmt::format_to_n(buf, size, "{:.2f}T", static_cast<double>(n) / expTo1024(4));
-  } else if (n < expTo1024(6)) {
-    fmt::format_to_n(buf, size, "{:.2f}P", static_cast<double>(n) / expTo1024(5));
+std::string BytesToHuman(uint64_t n) {
+  if (n < ExpTo1024(1)) {
+    return fmt::format("{}B", n);
+  } else if (n < ExpTo1024(2)) {
+    return fmt::format("{:.2f}K", static_cast<double>(n) / ExpTo1024(1));
+  } else if (n < ExpTo1024(3)) {
+    return fmt::format("{:.2f}M", static_cast<double>(n) / ExpTo1024(2));
+  } else if (n < ExpTo1024(4)) {
+    return fmt::format("{:.2f}G", static_cast<double>(n) / ExpTo1024(3));
+  } else if (n < ExpTo1024(5)) {
+    return fmt::format("{:.2f}T", static_cast<double>(n) / ExpTo1024(4));
+  } else if (n < ExpTo1024(6)) {
+    return fmt::format("{:.2f}P", static_cast<double>(n) / ExpTo1024(5));
   } else {
-    fmt::format_to_n(buf, size, "{}B", n);
+    return fmt::format("{}B", n);
   }
 }
 
@@ -251,17 +254,20 @@ std::vector<std::string> TokenizeRedisProtocol(const std::string &value) {
   uint64_t array_len = 0, bulk_len = 0;
   int state = stateArrayLen;
   const char *start = value.data(), *end = start + value.size(), *p = nullptr;
+
   while (start != end) {
     switch (state) {
       case stateArrayLen: {
         if (start[0] != '*') {
           return tokens;
         }
+
         p = strchr(start, '\r');
         if (!p || (p == end) || p[1] != '\n') {
           tokens.clear();
           return tokens;
         }
+
         // parse_result expects to must be parsed successfully here
         array_len = *ParseInt<uint64_t>(std::string(start + 1, p), 10);
         start = p + 2;
@@ -272,11 +278,13 @@ std::vector<std::string> TokenizeRedisProtocol(const std::string &value) {
         if (start[0] != '$') {
           return tokens;
         }
+
         p = strchr(start, '\r');
         if (!p || (p == end) || p[1] != '\n') {
           tokens.clear();
           return tokens;
         }
+
         // parse_result expects to must be parsed successfully here
         bulk_len = *ParseInt<uint64_t>(std::string(start + 1, p), 10);
         start = p + 2;
@@ -288,6 +296,7 @@ std::vector<std::string> TokenizeRedisProtocol(const std::string &value) {
           tokens.clear();
           return tokens;
         }
+
         tokens.emplace_back(start, start + bulk_len);
         start += bulk_len + 2;
         state = stateBulkLen;
@@ -295,10 +304,12 @@ std::vector<std::string> TokenizeRedisProtocol(const std::string &value) {
       }
     }
   }
+
   if (array_len != tokens.size()) {
     tokens.clear();
   }
+
   return tokens;
 }
 
-}  // namespace Util
+}  // namespace util

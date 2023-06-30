@@ -30,7 +30,7 @@
 
 class Server;
 
-namespace Redis {
+namespace redis {
 
 using CommandTokens = std::vector<std::string>;
 
@@ -39,6 +39,8 @@ class Connection;
 class Request {
  public:
   explicit Request(Server *svr) : svr_(svr) {}
+  ~Request() = default;
+
   // Not copyable
   Request(const Request &) = delete;
   Request &operator=(const Request &) = delete;
@@ -61,4 +63,4 @@ class Request {
   Server *svr_;
 };
 
-}  // namespace Redis
+}  // namespace redis

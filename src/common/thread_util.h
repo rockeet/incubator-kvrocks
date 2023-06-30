@@ -20,8 +20,29 @@
 
 #pragma once
 
-namespace Util {
+#include <system_error>
+#include <thread>
+
+#include "fmt/core.h"
+#include "status.h"
+
+namespace util {
 
 void ThreadSetName(const char *name);
 
-}  // namespace Util
+template <typename F>
+StatusOr<std::thread> CreateThread(const char *name, F f) {
+  try {
+    return std::thread([name, f = std::move(f)] {
+      ThreadSetName(name);
+      f();
+    });
+  } catch (const std::system_error &e) {
+    return {Status::NotOK, fmt::format("thread '{}' cannot be started: {}", name, e.what())};
+  }
+}
+
+Status ThreadJoin(std::thread &t);
+Status ThreadDetach(std::thread &t);
+
+}  // namespace util

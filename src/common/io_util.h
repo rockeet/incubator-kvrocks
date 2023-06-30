@@ -24,23 +24,25 @@
 
 #include "status.h"
 
-namespace Util {
+namespace util {
 
 sockaddr_in NewSockaddrInet(const std::string &host, uint32_t port);
-Status SockConnect(const std::string &host, uint32_t port, int *fd, int conn_timeout = 0, int timeout = 0);
+StatusOr<int> SockConnect(const std::string &host, uint32_t port, int conn_timeout = 0, int timeout = 0);
 Status SockSetTcpNoDelay(int fd, int val);
 Status SockSetTcpKeepalive(int fd, int interval);
 Status SockSend(int fd, const std::string &data);
-Status SockReadLine(int fd, std::string *data);
+StatusOr<std::string> SockReadLine(int fd);
 Status SockSendFile(int out_fd, int in_fd, size_t size);
 Status SockSetBlocking(int fd, int blocking);
 int GetPeerAddr(int fd, std::string *addr, uint32_t *port);
 int GetLocalPort(int fd);
 bool IsPortInUse(uint32_t port);
 
-int aeWait(int fd, int mask, int milliseconds);
+bool MatchListeningIP(std::vector<std::string> &binds, const std::string &ip);
+std::vector<std::string> GetLocalIPAddresses();
 
+int AeWait(int fd, int mask, int milliseconds);
 Status Write(int fd, const std::string &data);
 Status Pwrite(int fd, const std::string &data, off_t offset);
 
-}  // namespace Util
+}  // namespace util

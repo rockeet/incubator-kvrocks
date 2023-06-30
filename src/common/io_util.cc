@@ -23,17 +23,19 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <fmt/format.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
-#include <sys/poll.h>
+#include <poll.h>
+#include <sys/types.h>
 
 #ifdef __linux__
 #include <sys/sendfile.h>
 #endif
 
 #include "event_util.h"
-#include "fd_util.h"
 #include "scope_exit.h"
+#include "unique_fd.h"
 
 #ifndef POLLIN
 #define POLLIN 0x0001   /* There is data to read */
@@ -49,7 +51,8 @@
 #define AE_ERROR 4     // NOLINT
 #define AE_HUP 8       // NOLINT
 
-namespace Util {
+namespace util {
+
 Status SockSetTcpNoDelay(int fd, int val) {
   if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)) == -1) {
     return Status::FromErrno();
@@ -71,7 +74,7 @@ Status SockSetTcpKeepalive(int fd, int interval) {
   // Send first probe after interval.
   val = interval;
   if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &val, sizeof(val)) < 0) {
-    return {Status::NotOK, fmt::format("setsockopt TCP_KEEPIDLE: {}", strerror(errno))};
+    return Status::FromErrno("setsockopt TCP_KEEPIDLE");
   }
 
   // Send next probes after the specified interval. Note that we set the
@@ -80,14 +83,14 @@ Status SockSetTcpKeepalive(int fd, int interval) {
   val = interval / 3;
   if (val == 0) val = 1;
   if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &val, sizeof(val)) < 0) {
-    return {Status::NotOK, fmt::format("setsockopt TCP_KEEPINTVL: {}", strerror(errno))};
+    return Status::FromErrno("setsockopt TCP_KEEPINTVL");
   }
 
   // Consider the socket in error state after three we send three ACK
   // probes without getting a reply.
   val = 3;
   if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &val, sizeof(val)) < 0) {
-    return {Status::NotOK, fmt::format("setsockopt TCP_KEEPCNT: {}", strerror(errno))};
+    return Status::FromErrno("setsockopt TCP_KEEPCNT");
   }
 #else
   ((void)interval);  // Avoid unused var warning for non Linux systems.
@@ -96,19 +99,19 @@ Status SockSetTcpKeepalive(int fd, int interval) {
   return Status::OK();
 }
 
-Status SockConnect(const std::string &host, uint32_t port, int *fd, int conn_timeout, int timeout) {
-  addrinfo hints, *servinfo = nullptr, *p = nullptr;
+StatusOr<int> SockConnect(const std::string &host, uint32_t port, int conn_timeout, int timeout) {
+  addrinfo hints = {}, *servinfo = nullptr;
 
-  memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
 
   if (int rv = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &servinfo); rv != 0) {
     return {Status::NotOK, gai_strerror(rv)};
   }
+
   auto exit = MakeScopeExit([servinfo] { freeaddrinfo(servinfo); });
 
-  for (p = servinfo; p != nullptr; p = p->ai_next) {
+  for (auto p = servinfo; p != nullptr; p = p->ai_next) {
     auto cfd = UniqueFD(socket(p->ai_family, p->ai_socktype, p->ai_protocol));
     if (!cfd) continue;
 
@@ -122,16 +125,18 @@ Status SockConnect(const std::string &host, uint32_t port, int *fd, int conn_tim
       if (ret != 0 && errno != EINPROGRESS) {
         continue;
       }
-      auto retmask = Util::aeWait(*cfd, AE_WRITABLE, conn_timeout);
+
+      auto retmask = util::AeWait(*cfd, AE_WRITABLE, conn_timeout);
       if ((retmask & AE_WRITABLE) == 0 || (retmask & AE_ERROR) != 0 || (retmask & AE_HUP) != 0) {
         return Status::FromErrno();
       }
 
       // restore to the block mode
       int socket_arg = 0;
-      if ((socket_arg = fcntl(*cfd, F_GETFL, NULL)) < 0) {
+      if (socket_arg = fcntl(*cfd, F_GETFL, NULL); socket_arg < 0) {
         return Status::FromErrno();
       }
+
       socket_arg &= (~O_NONBLOCK);
       if (fcntl(*cfd, F_SETFL, socket_arg) < 0) {
         return Status::FromErrno();
@@ -145,16 +150,16 @@ Status SockConnect(const std::string &host, uint32_t port, int *fd, int conn_tim
     if (!s.IsOK()) {
       continue;
     }
+
     if (timeout > 0) {
-      struct timeval tv;
+      timeval tv;
       tv.tv_sec = timeout / 1000;
       tv.tv_usec = (timeout % 1000) * 1000;
       if (setsockopt(*cfd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char *>(&tv), sizeof(tv)) < 0) {
-        return Status(Status::NotOK, std::string("setsockopt failed: ") + strerror(errno));
+        return Status::FromErrno("setsockopt failed");
       }
     }
-    *fd = cfd.Release();
-    return Status::OK();
+    return cfd.Release();
   }
   return Status::FromErrno();
 }
@@ -191,16 +196,15 @@ ssize_t SockSendFileCore(int out_fd, int in_fd, off_t offset, size_t count) {
 // Send file by sendfile actually according to different operation systems,
 // please note that, the out socket fd should be in blocking mode.
 Status SockSendFile(int out_fd, int in_fd, size_t size) {
-  ssize_t nwritten = 0;
   off_t offset = 0;
   while (size != 0) {
     size_t n = size <= 16 * 1024 ? size : 16 * 1024;
-    nwritten = SockSendFileCore(out_fd, in_fd, offset, n);
+    ssize_t nwritten = SockSendFileCore(out_fd, in_fd, offset, n);
     if (nwritten == -1) {
       if (errno == EINTR)
         continue;
       else
-        return Status(Status::NotOK, strerror(errno));
+        return Status::FromErrno();
     }
     size -= nwritten;
     offset += nwritten;
@@ -211,8 +215,8 @@ Status SockSendFile(int out_fd, int in_fd, size_t size) {
 Status SockSetBlocking(int fd, int blocking) {
   int flags = 0;
   // Old flags
-  if ((flags = fcntl(fd, F_GETFL)) == -1) {
-    return Status(Status::NotOK, std::string("fcntl(F_GETFL): ") + strerror(errno));
+  if (flags = fcntl(fd, F_GETFL); flags == -1) {
+    return Status::FromErrno("fcntl(F_GETFL)");
   }
 
   // New flags
@@ -222,22 +226,23 @@ Status SockSetBlocking(int fd, int blocking) {
     flags |= O_NONBLOCK;
 
   if (fcntl(fd, F_SETFL, flags) == -1) {
-    return Status(Status::NotOK, std::string("fcntl(F_SETFL,O_BLOCK): ") + strerror(errno));
+    return Status::FromErrno("fcntl(F_SETFL,O_BLOCK)");
   }
   return Status::OK();
 }
 
-Status SockReadLine(int fd, std::string *data) {
+StatusOr<std::string> SockReadLine(int fd) {
   UniqueEvbuf evbuf;
   if (evbuffer_read(evbuf.get(), fd, -1) <= 0) {
-    return Status(Status::NotOK, std::string("read response err: ") + strerror(errno));
+    return Status::FromErrno("read response err");
   }
+
   UniqueEvbufReadln line(evbuf.get(), EVBUFFER_EOL_CRLF_STRICT);
   if (!line) {
-    return Status(Status::NotOK, std::string("read response err(empty): ") + strerror(errno));
+    return Status::FromErrno("read response err(empty)");
   }
-  *data = std::string(line.get(), line.length);
-  return Status::OK();
+
+  return std::string(line.get(), line.length);
 }
 
 int GetPeerAddr(int fd, std::string *addr, uint32_t *port) {
@@ -248,6 +253,7 @@ int GetPeerAddr(int fd, std::string *addr, uint32_t *port) {
   if (getpeername(fd, reinterpret_cast<sockaddr *>(&sa), &sa_len) < 0) {
     return -1;
   }
+
   if (sa.ss_family == AF_INET6) {
     char buf[INET6_ADDRSTRLEN];
     auto sa6 = reinterpret_cast<sockaddr_in6 *>(&sa);
@@ -281,24 +287,23 @@ int GetLocalPort(int fd) {
 }
 
 bool IsPortInUse(uint32_t port) {
-  int fd = NullFD;
-  Status s = SockConnect("0.0.0.0", port, &fd);
-  if (fd != NullFD) close(fd);
+  auto s = SockConnect("0.0.0.0", port);
+  if (s) close(*s);
   return s.IsOK();
 }
 
 /* Wait for milliseconds until the given file descriptor becomes
  * writable/readable/exception */
-int aeWait(int fd, int mask, int timeout) {
+int AeWait(int fd, int mask, int timeout) {
   pollfd pfd;
-  int retmask = 0, retval = 0;
+  int retmask = 0;
 
   memset(&pfd, 0, sizeof(pfd));
   pfd.fd = fd;
   if (mask & AE_READABLE) pfd.events |= POLLIN;
   if (mask & AE_WRITABLE) pfd.events |= POLLOUT;
 
-  if ((retval = poll(&pfd, 1, timeout)) == 1) {
+  if (int retval = poll(&pfd, 1, timeout); retval == 1) {
     if (pfd.revents & POLLIN) retmask |= AE_READABLE;
     if (pfd.revents & POLLOUT) retmask |= AE_WRITABLE;
     if (pfd.revents & POLLERR) retmask |= AE_ERROR;
@@ -307,6 +312,52 @@ int aeWait(int fd, int mask, int timeout) {
   } else {
     return retval;
   }
+}
+
+bool MatchListeningIP(std::vector<std::string> &binds, const std::string &ip) {
+  if (std::find(binds.begin(), binds.end(), ip) != binds.end()) {
+    return true;
+  }
+
+  // If binds contains 0.0.0.0, we should resolve ip addresses and check it
+  if (std::find(binds.begin(), binds.end(), "0.0.0.0") != binds.end() ||
+      std::find(binds.begin(), binds.end(), "::") != binds.end()) {
+    auto local_ip_addresses = GetLocalIPAddresses();
+    return std::find(local_ip_addresses.begin(), local_ip_addresses.end(), ip) != local_ip_addresses.end();
+  }
+  return false;
+}
+
+std::vector<std::string> GetLocalIPAddresses() {
+  std::vector<std::string> ip_addresses;
+  ifaddrs *if_addr_struct = nullptr;
+  std::unique_ptr<ifaddrs, decltype(&freeifaddrs)> ifaddrs_ptr(nullptr, &freeifaddrs);
+  if (getifaddrs(&if_addr_struct) == -1) {
+    return ip_addresses;
+  }
+  ifaddrs_ptr.reset(if_addr_struct);
+
+  for (ifaddrs *ifa = if_addr_struct; ifa; ifa = ifa->ifa_next) {
+    if (!ifa->ifa_addr) {
+      continue;
+    }
+    void *tmp_addr_ptr = nullptr;
+    if (ifa->ifa_addr->sa_family == AF_INET) {
+      // check it is IPv4
+      tmp_addr_ptr = &((sockaddr_in *)ifa->ifa_addr)->sin_addr;
+      char address_buffer[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, tmp_addr_ptr, address_buffer, INET_ADDRSTRLEN);
+      ip_addresses.emplace_back(address_buffer);
+    } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+      // check it is IPv6
+      tmp_addr_ptr = &((sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+      char address_buffer[INET6_ADDRSTRLEN];
+      inet_ntop(AF_INET6, tmp_addr_ptr, address_buffer, INET6_ADDRSTRLEN);
+      ip_addresses.emplace_back(address_buffer);
+    }
+  }
+
+  return ip_addresses;
 }
 
 template <auto syscall, typename... Args>
@@ -326,4 +377,4 @@ Status Write(int fd, const std::string &data) { return WriteImpl<write>(fd, data
 
 Status Pwrite(int fd, const std::string &data, off_t offset) { return WriteImpl<pwrite>(fd, data, offset); }
 
-}  // namespace Util
+}  // namespace util

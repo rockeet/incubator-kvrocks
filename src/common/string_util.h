@@ -22,12 +22,12 @@
 
 #include "status.h"
 
-namespace Util {
+namespace util {
 
-const std::string Float2String(double d);
+std::string Float2String(double d);
 std::string ToLower(std::string in);
 bool EqualICase(std::string_view lhs, std::string_view rhs);
-void BytesToHuman(char *buf, size_t size, uint64_t n);
+std::string BytesToHuman(uint64_t n);
 std::string Trim(std::string in, const std::string &chars);
 std::vector<std::string> Split(const std::string &in, const std::string &delim);
 std::vector<std::string> Split2KV(const std::string &in, const std::string &delim);
@@ -37,4 +37,4 @@ int StringMatchLen(const char *p, size_t plen, const char *s, size_t slen, int n
 std::string StringToHex(const std::string &input);
 std::vector<std::string> TokenizeRedisProtocol(const std::string &value);
 
-}  // namespace Util
+}  // namespace util

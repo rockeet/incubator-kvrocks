@@ -22,6 +22,7 @@
 
 #include <event2/bufferevent.h>
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <string>
@@ -30,6 +31,7 @@
 #include <utility>
 #include <vector>
 
+#include "event_util.h"
 #include "server/redis_connection.h"
 #include "status.h"
 #include "storage/storage.h"
@@ -55,11 +57,11 @@ enum WriteBatchType {
   kBatchTypeStream,
 };
 
-using fetch_file_callback = std::function<void(const std::string, const uint32_t)>;
+using FetchFileCallback = std::function<void(const std::string, const uint32_t)>;
 
 class FeedSlaveThread {
  public:
-  explicit FeedSlaveThread(Server *srv, Redis::Connection *conn, rocksdb::SequenceNumber next_repl_seq)
+  explicit FeedSlaveThread(Server *srv, redis::Connection *conn, rocksdb::SequenceNumber next_repl_seq)
       : srv_(srv), conn_(conn), next_repl_seq_(next_repl_seq) {}
   ~FeedSlaveThread() = default;
 
@@ -67,31 +69,37 @@ class FeedSlaveThread {
   void Stop();
   void Join();
   bool IsStopped() { return stop_; }
-  Redis::Connection *GetConn() { return conn_.get(); }
-  rocksdb::SequenceNumber GetCurrentReplSeq() { return next_repl_seq_ == 0 ? 0 : next_repl_seq_ - 1; }
+  redis::Connection *GetConn() { return conn_.get(); }
+  rocksdb::SequenceNumber GetCurrentReplSeq() {
+    auto seq = next_repl_seq_.load();
+    return seq == 0 ? 0 : seq - 1;
+  }
 
  private:
-  uint64_t interval = 0;
-  bool stop_ = false;
+  uint64_t interval_ = 0;
+  std::atomic<bool> stop_ = false;
   Server *srv_ = nullptr;
-  std::unique_ptr<Redis::Connection> conn_ = nullptr;
-  rocksdb::SequenceNumber next_repl_seq_ = 0;
+  std::unique_ptr<redis::Connection> conn_ = nullptr;
+  std::atomic<rocksdb::SequenceNumber> next_repl_seq_ = 0;
   std::thread t_;
   std::unique_ptr<rocksdb::TransactionLogIterator> iter_ = nullptr;
-  const size_t kMaxDelayUpdates = 16;
-  const size_t kMaxDelayBytes = 16 * 1024;
+
+  static const size_t kMaxDelayUpdates = 16;
+  static const size_t kMaxDelayBytes = 16 * 1024;
 
   void loop();
   void checkLivenessIfNeed();
 };
 
-class ReplicationThread {
+class ReplicationThread : private EventCallbackBase<ReplicationThread> {
  public:
   explicit ReplicationThread(std::string host, uint32_t port, Server *srv);
   Status Start(std::function<void()> &&pre_fullsync_cb, std::function<void()> &&post_fullsync_cb);
   void Stop();
-  ReplState State() { return repl_state_; }
-  time_t LastIOTime() { return last_io_time_; }
+  ReplState State() { return repl_state_.load(std::memory_order_relaxed); }
+  time_t LastIOTime() { return last_io_time_.load(std::memory_order_relaxed); }
+
+  void TimerCB(int, int16_t);
 
  protected:
   event_base *base_ = nullptr;
@@ -137,14 +145,15 @@ class ReplicationThread {
 
  private:
   std::thread t_;
-  bool stop_flag_ = false;
+  std::atomic<bool> stop_flag_ = false;
   std::string host_;
   uint32_t port_;
   Server *srv_ = nullptr;
-  Engine::Storage *storage_ = nullptr;
-  ReplState repl_state_;
-  time_t last_io_time_ = 0;
+  engine::Storage *storage_ = nullptr;
+  std::atomic<ReplState> repl_state_;
+  std::atomic<time_t> last_io_time_ = 0;
   bool next_try_old_psync_ = false;
+  bool next_try_without_announce_ip_address_ = false;
 
   std::function<void()> pre_fullsync_cb_;
   std::function<void()> post_fullsync_cb_;
@@ -187,16 +196,15 @@ class ReplicationThread {
   // Synchronized-Blocking ops
   Status sendAuth(int sock_fd);
   Status fetchFile(int sock_fd, evbuffer *evbuf, const std::string &dir, const std::string &file, uint32_t crc,
-                   const fetch_file_callback &fn);
+                   const FetchFileCallback &fn);
   Status fetchFiles(int sock_fd, const std::string &dir, const std::vector<std::string> &files,
-                    const std::vector<uint32_t> &crcs, const fetch_file_callback &fn);
+                    const std::vector<uint32_t> &crcs, const FetchFileCallback &fn);
   Status parallelFetchFile(const std::string &dir, const std::vector<std::pair<std::string, uint32_t>> &files);
   static bool isRestoringError(const char *err);
   static bool isWrongPsyncNum(const char *err);
+  static bool isUnknownOption(const char *err);
 
-  static void EventTimerCB(int, int16_t, void *ctx);
-
-  rocksdb::Status ParseWriteBatch(const std::string &batch_string);
+  Status parseWriteBatch(const std::string &batch_string);
 };
 
 /*

@@ -22,15 +22,18 @@
 
 #include <cstdlib>
 #include <memory>
+#include <type_traits>
 #include <utility>
 
 #include "event2/buffer.h"
+#include "event2/bufferevent.h"
+#include "event2/event.h"
 
 template <typename F, F *f>
 struct StaticFunction {
   template <typename... Ts>
   auto operator()(Ts &&...args) const -> decltype(f(std::forward<Ts>(args)...)) {  // NOLINT
-    return f(std::forward<Ts>(args)...);
+    return f(std::forward<Ts>(args)...);                                           // NOLINT
   }
 };
 
@@ -38,9 +41,9 @@ using StaticFree = StaticFunction<decltype(std::free), std::free>;
 
 template <typename T>
 struct UniqueFreePtr : std::unique_ptr<T, StaticFree> {
-  using base_type = std::unique_ptr<T, StaticFree>;
+  using BaseType = std::unique_ptr<T, StaticFree>;
 
-  using base_type::base_type;
+  using BaseType::BaseType;
 };
 
 struct UniqueEvbufReadln : UniqueFreePtr<char[]> {
@@ -53,8 +56,73 @@ struct UniqueEvbufReadln : UniqueFreePtr<char[]> {
 using StaticEvbufFree = StaticFunction<decltype(evbuffer_free), evbuffer_free>;
 
 struct UniqueEvbuf : std::unique_ptr<evbuffer, StaticEvbufFree> {
-  using base_type = std::unique_ptr<evbuffer, StaticEvbufFree>;
+  using BaseType = std::unique_ptr<evbuffer, StaticEvbufFree>;
 
-  UniqueEvbuf() : base_type(evbuffer_new()) {}
-  explicit UniqueEvbuf(evbuffer *buffer) : base_type(buffer) {}
+  UniqueEvbuf() : BaseType(evbuffer_new()) {}
+  explicit UniqueEvbuf(evbuffer *buffer) : BaseType(buffer) {}
+};
+
+using StaticEventFree = StaticFunction<decltype(event_free), event_free>;
+
+struct UniqueEvent : std::unique_ptr<event, StaticEventFree> {
+  using BaseType = std::unique_ptr<event, StaticEventFree>;
+
+  UniqueEvent() : BaseType(nullptr) {}
+  explicit UniqueEvent(event *buffer) : BaseType(buffer) {}
+};
+
+template <typename Derived, bool ReadCB = true, bool WriteCB = true, bool EventCB = true>
+struct EvbufCallbackBase {
+ private:
+  static void readCB(bufferevent *bev, void *ctx) { static_cast<Derived *>(ctx)->OnRead(bev); }
+
+  static void writeCB(bufferevent *bev, void *ctx) { static_cast<Derived *>(ctx)->OnWrite(bev); }
+
+  static void eventCB(bufferevent *bev, short what, void *ctx) { static_cast<Derived *>(ctx)->OnEvent(bev, what); }
+
+  template <bool Enabled, std::enable_if_t<Enabled, int> = 0>
+  static auto getReadCB() {
+    return readCB;
+  }
+  template <bool Enabled, std::enable_if_t<!Enabled, int> = 0>
+  static auto getReadCB() {
+    return nullptr;
+  };
+
+  template <bool Enabled, std::enable_if_t<Enabled, int> = 0>
+  static auto getWriteCB() {
+    return writeCB;
+  }
+  template <bool Enabled, std::enable_if_t<!Enabled, int> = 0>
+  static auto getWriteCB() {
+    return nullptr;
+  };
+
+  template <bool Enabled, std::enable_if_t<Enabled, int> = 0>
+  static auto getEventCB() {
+    return eventCB;
+  }
+  template <bool Enabled, std::enable_if_t<!Enabled, int> = 0>
+  static auto getEventCB() {
+    return nullptr;
+  };
+
+ public:
+  void SetCB(bufferevent *bev) {
+    bufferevent_setcb(bev, getReadCB<ReadCB>(), getWriteCB<WriteCB>(), getEventCB<EventCB>(),
+                      reinterpret_cast<void *>(this));
+  }
+};
+
+template <typename Derived>
+struct EventCallbackBase {
+ private:
+  static void timerCB(evutil_socket_t fd, short events, void *ctx) { static_cast<Derived *>(ctx)->TimerCB(fd, events); }
+
+ public:
+  event *NewEvent(event_base *base, evutil_socket_t fd, short events) {
+    return event_new(base, fd, events, timerCB, reinterpret_cast<void *>(this));
+  }
+
+  event *NewTimer(event_base *base) { return evtimer_new(base, timerCB, reinterpret_cast<void *>(this)); }
 };

@@ -20,13 +20,12 @@
 
 #include "redis_set.h"
 
-#include <iostream>
 #include <map>
 #include <memory>
 
 #include "db_util.h"
 
-namespace Redis {
+namespace redis {
 
 rocksdb::Status Set::GetMetadata(const Slice &ns_key, SetMetadata *metadata) {
   return Database::GetMetadata(kRedisSet, ns_key, metadata);
@@ -39,19 +38,19 @@ rocksdb::Status Set::Overwrite(Slice user_key, const std::vector<std::string> &m
 
   LockGuard guard(storage_->GetLockManager(), ns_key);
   SetMetadata metadata;
-  rocksdb::WriteBatch batch;
+  auto batch = storage_->GetWriteBatchBase();
   WriteBatchLogData log_data(kRedisSet);
-  batch.PutLogData(log_data.Encode());
+  batch->PutLogData(log_data.Encode());
   std::string sub_key;
   for (const auto &member : members) {
     InternalKey(ns_key, member, metadata.version, storage_->IsSlotIdEncoded()).Encode(&sub_key);
-    batch.Put(sub_key, Slice());
+    batch->Put(sub_key, Slice());
   }
   metadata.size = static_cast<uint32_t>(members.size());
   std::string bytes;
   metadata.Encode(&bytes);
-  batch.Put(metadata_cf_handle_, ns_key, bytes);
-  return storage_->Write(storage_->DefaultWriteOptions(), &batch);
+  batch->Put(metadata_cf_handle_, ns_key, bytes);
+  return storage_->Write(storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
 
 rocksdb::Status Set::Add(const Slice &user_key, const std::vector<Slice> &members, int *ret) {
@@ -66,24 +65,24 @@ rocksdb::Status Set::Add(const Slice &user_key, const std::vector<Slice> &member
   if (!s.ok() && !s.IsNotFound()) return s;
 
   std::string value;
-  rocksdb::WriteBatch batch;
+  auto batch = storage_->GetWriteBatchBase();
   WriteBatchLogData log_data(kRedisSet);
-  batch.PutLogData(log_data.Encode());
+  batch->PutLogData(log_data.Encode());
   std::string sub_key;
   for (const auto &member : members) {
     InternalKey(ns_key, member, metadata.version, storage_->IsSlotIdEncoded()).Encode(&sub_key);
-    s = db_->Get(rocksdb::ReadOptions(), sub_key, &value);
+    s = storage_->Get(rocksdb::ReadOptions(), sub_key, &value);
     if (s.ok()) continue;
-    batch.Put(sub_key, Slice());
+    batch->Put(sub_key, Slice());
     *ret += 1;
   }
   if (*ret > 0) {
     metadata.size += *ret;
     std::string bytes;
     metadata.Encode(&bytes);
-    batch.Put(metadata_cf_handle_, ns_key, bytes);
+    batch->Put(metadata_cf_handle_, ns_key, bytes);
   }
-  return storage_->Write(storage_->DefaultWriteOptions(), &batch);
+  return storage_->Write(storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
 
 rocksdb::Status Set::Remove(const Slice &user_key, const std::vector<Slice> &members, int *ret) {
@@ -98,14 +97,14 @@ rocksdb::Status Set::Remove(const Slice &user_key, const std::vector<Slice> &mem
   if (!s.ok()) return s.IsNotFound() ? rocksdb::Status::OK() : s;
 
   std::string value, sub_key;
-  rocksdb::WriteBatch batch;
+  auto batch = storage_->GetWriteBatchBase();
   WriteBatchLogData log_data(kRedisSet);
-  batch.PutLogData(log_data.Encode());
+  batch->PutLogData(log_data.Encode());
   for (const auto &member : members) {
     InternalKey(ns_key, member, metadata.version, storage_->IsSlotIdEncoded()).Encode(&sub_key);
-    s = db_->Get(rocksdb::ReadOptions(), sub_key, &value);
+    s = storage_->Get(rocksdb::ReadOptions(), sub_key, &value);
     if (!s.ok()) continue;
-    batch.Delete(sub_key);
+    batch->Delete(sub_key);
     *ret += 1;
   }
   if (*ret > 0) {
@@ -113,12 +112,12 @@ rocksdb::Status Set::Remove(const Slice &user_key, const std::vector<Slice> &mem
       metadata.size -= *ret;
       std::string bytes;
       metadata.Encode(&bytes);
-      batch.Put(metadata_cf_handle_, ns_key, bytes);
+      batch->Put(metadata_cf_handle_, ns_key, bytes);
     } else {
-      batch.Delete(metadata_cf_handle_, ns_key);
+      batch->Delete(metadata_cf_handle_, ns_key);
     }
   }
-  return storage_->Write(storage_->DefaultWriteOptions(), &batch);
+  return storage_->Write(storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
 
 rocksdb::Status Set::Card(const Slice &user_key, int *ret) {
@@ -148,13 +147,13 @@ rocksdb::Status Set::Members(const Slice &user_key, std::vector<std::string> *me
   InternalKey(ns_key, "", metadata.version + 1, storage_->IsSlotIdEncoded()).Encode(&next_version_prefix);
 
   rocksdb::ReadOptions read_options;
-  LatestSnapShot ss(db_);
+  LatestSnapShot ss(storage_);
   read_options.snapshot = ss.GetSnapShot();
   rocksdb::Slice upper_bound(next_version_prefix);
   read_options.iterate_upper_bound = &upper_bound;
-  read_options.fill_cache = false;
+  storage_->SetReadOptions(read_options);
 
-  auto iter = DBUtil::UniqueIterator(db_, read_options);
+  auto iter = util::UniqueIterator(storage_, read_options);
   for (iter->Seek(prefix); iter->Valid() && iter->key().starts_with(prefix); iter->Next()) {
     InternalKey ikey(iter->key(), storage_->IsSlotIdEncoded());
     members->emplace_back(ikey.GetSubKey().ToString());
@@ -181,12 +180,12 @@ rocksdb::Status Set::MIsMember(const Slice &user_key, const std::vector<Slice> &
   if (!s.ok()) return s;
 
   rocksdb::ReadOptions read_options;
-  LatestSnapShot ss(db_);
+  LatestSnapShot ss(storage_);
   read_options.snapshot = ss.GetSnapShot();
   std::string sub_key, value;
   for (const auto &member : members) {
     InternalKey(ns_key, member, metadata.version, storage_->IsSlotIdEncoded()).Encode(&sub_key);
-    s = db_->Get(read_options, sub_key, &value);
+    s = storage_->Get(read_options, sub_key, &value);
     if (!s.ok() && !s.IsNotFound()) return s;
     if (s.IsNotFound()) {
       exists->emplace_back(0);
@@ -212,35 +211,35 @@ rocksdb::Status Set::Take(const Slice &user_key, std::vector<std::string> *membe
   rocksdb::Status s = GetMetadata(ns_key, &metadata);
   if (!s.ok()) return s.IsNotFound() ? rocksdb::Status::OK() : s;
 
-  rocksdb::WriteBatch batch;
+  auto batch = storage_->GetWriteBatchBase();
   WriteBatchLogData log_data(kRedisSet);
-  batch.PutLogData(log_data.Encode());
+  batch->PutLogData(log_data.Encode());
 
   std::string prefix, next_version_prefix;
   InternalKey(ns_key, "", metadata.version, storage_->IsSlotIdEncoded()).Encode(&prefix);
   InternalKey(ns_key, "", metadata.version + 1, storage_->IsSlotIdEncoded()).Encode(&next_version_prefix);
 
   rocksdb::ReadOptions read_options;
-  LatestSnapShot ss(db_);
+  LatestSnapShot ss(storage_);
   read_options.snapshot = ss.GetSnapShot();
   rocksdb::Slice upper_bound(next_version_prefix);
   read_options.iterate_upper_bound = &upper_bound;
-  read_options.fill_cache = false;
+  storage_->SetReadOptions(read_options);
 
-  auto iter = DBUtil::UniqueIterator(db_, read_options);
+  auto iter = util::UniqueIterator(storage_, read_options);
   for (iter->Seek(prefix); iter->Valid() && iter->key().starts_with(prefix); iter->Next()) {
     InternalKey ikey(iter->key(), storage_->IsSlotIdEncoded());
     members->emplace_back(ikey.GetSubKey().ToString());
-    if (pop) batch.Delete(iter->key());
+    if (pop) batch->Delete(iter->key());
     if (++n >= count) break;
   }
   if (pop && n > 0) {
     metadata.size -= n;
     std::string bytes;
     metadata.Encode(&bytes);
-    batch.Put(metadata_cf_handle_, ns_key, bytes);
+    batch->Put(metadata_cf_handle_, ns_key, bytes);
   }
-  return storage_->Write(storage_->DefaultWriteOptions(), &batch);
+  return storage_->Write(storage_->DefaultWriteOptions(), batch->GetWriteBatch());
 }
 
 rocksdb::Status Set::Move(const Slice &src, const Slice &dst, const Slice &member, int *ret) {
@@ -340,7 +339,7 @@ rocksdb::Status Set::Inter(const std::vector<Slice> &keys, std::vector<std::stri
     member_counters[member] = 1;
   }
   for (size_t i = 1; i < keys.size(); i++) {
-    auto s = Members(keys[i], &target_members);
+    s = Members(keys[i], &target_members);
     if (!s.ok() || target_members.empty()) return s;
     for (const auto &member : target_members) {
       if (member_counters.find(member) == member_counters.end()) continue;
@@ -381,4 +380,4 @@ rocksdb::Status Set::InterStore(const Slice &dst, const std::vector<Slice> &keys
   *ret = static_cast<int>(members.size());
   return Overwrite(dst, members);
 }
-}  // namespace Redis
+}  // namespace redis

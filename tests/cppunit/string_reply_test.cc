@@ -31,22 +31,22 @@ class StringReplyTest : public testing::Test {
   }
   static void TearDownTestCase() { values.clear(); }
   static std::vector<std::string> values;
-  virtual void SetUp() {}
 
-  virtual void TearDown() {}
+  void SetUp() override {}
+  void TearDown() override {}
 };
 
 std::vector<std::string> StringReplyTest::values;
 
 TEST_F(StringReplyTest, MultiBulkString) {
-  std::string result = Redis::MultiBulkString(values);
+  std::string result = redis::MultiBulkString(values);
   ASSERT_EQ(result.length(), 13 * 10 + 14 * 90 + 15 * 900 + 17 * 9000 + 18 * 90000 + 9);
 }
 
 TEST_F(StringReplyTest, BulkString) {
   std::string result = "*" + std::to_string(values.size()) + CRLF;
   for (const auto &v : values) {
-    result += Redis::BulkString(v);
+    result += redis::BulkString(v);
   }
 
   ASSERT_EQ(result.length(), 13 * 10 + 14 * 90 + 15 * 900 + 17 * 9000 + 18 * 90000 + 9);

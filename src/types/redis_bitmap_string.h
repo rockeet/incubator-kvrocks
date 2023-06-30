@@ -26,20 +26,19 @@
 #include "storage/redis_db.h"
 #include "storage/redis_metadata.h"
 
-namespace Redis {
+namespace redis {
 
 class BitmapString : public Database {
  public:
-  BitmapString(Engine::Storage *storage, const std::string &ns) : Database(storage, ns) {}
-  rocksdb::Status GetBit(const std::string &raw_value, uint32_t offset, bool *bit);
+  BitmapString(engine::Storage *storage, const std::string &ns) : Database(storage, ns) {}
+  static rocksdb::Status GetBit(const std::string &raw_value, uint32_t offset, bool *bit);
   rocksdb::Status SetBit(const Slice &ns_key, std::string *raw_value, uint32_t offset, bool new_bit, bool *old_bit);
-  rocksdb::Status BitCount(const std::string &raw_value, int64_t start, int64_t stop, uint32_t *cnt);
-  rocksdb::Status BitPos(const std::string &raw_value, bool bit, int64_t start, int64_t stop, bool stop_given,
-                         int64_t *pos);
+  static rocksdb::Status BitCount(const std::string &raw_value, int64_t start, int64_t stop, uint32_t *cnt);
+  static rocksdb::Status BitPos(const std::string &raw_value, bool bit, int64_t start, int64_t stop, bool stop_given,
+                                int64_t *pos);
 
- private:
-  size_t redisPopcount(unsigned char *p, int64_t count);
-  int64_t redisBitpos(unsigned char *c, int64_t count, int bit);
+  static size_t RawPopcount(const uint8_t *p, int64_t count);
+  static int64_t RawBitpos(const uint8_t *c, int64_t count, bool bit);
 };
 
-}  // namespace Redis
+}  // namespace redis

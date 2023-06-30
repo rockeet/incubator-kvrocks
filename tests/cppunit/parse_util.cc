@@ -22,8 +22,8 @@
 #include <parse_util.h>
 
 TEST(ParseUtil, TryParseInt) {
-  long long v;
-  const char *str = "12345hellooo", *end;
+  long long v = 0;
+  const char *str = "12345hellooo", *end = nullptr;
 
   std::tie(v, end) = *TryParseInt(str);
   ASSERT_EQ(v, 12345);
@@ -53,4 +53,40 @@ TEST(ParseUtil, ParseInt) {
 
   ASSERT_EQ(*ParseInt("123", {0, 123}), 123);
   ASSERT_EQ(ParseInt("124", {0, 123}).Msg(), "out of numeric range");
+}
+
+TEST(ParseUtil, ParseSizeAndUnit) {
+  ASSERT_EQ(*ParseSizeAndUnit("123"), 123);
+  ASSERT_EQ(*ParseSizeAndUnit("123K"), 123 * 1024);
+  ASSERT_EQ(*ParseSizeAndUnit("123m"), 123 * 1024 * 1024);
+  ASSERT_EQ(*ParseSizeAndUnit("123G"), 123ull << 30);
+  ASSERT_EQ(*ParseSizeAndUnit("123t"), 123ull << 40);
+  ASSERT_FALSE(ParseSizeAndUnit("123x"));
+  ASSERT_FALSE(ParseSizeAndUnit("123 t"));
+  ASSERT_FALSE(ParseSizeAndUnit("123 "));
+  ASSERT_FALSE(ParseSizeAndUnit("t"));
+  ASSERT_TRUE(ParseSizeAndUnit("16383p"));
+  ASSERT_FALSE(ParseSizeAndUnit("16384p"));
+  ASSERT_EQ(ParseSizeAndUnit("16388p").Msg(), "arithmetic overflow");
+}
+
+TEST(ParseUtil, ParseFloat) {
+  std::string v = "1.23";
+  ASSERT_EQ(*TryParseFloat(v.c_str()), ParseResultAndPos<double>(1.23, v.c_str() + v.size()));
+
+  v = "25345.346e65hello";
+  ASSERT_EQ(*TryParseFloat(v.c_str()), ParseResultAndPos<double>(25345.346e65, v.c_str() + v.size() - 5));
+
+  ASSERT_FALSE(TryParseFloat("eeeeeeee"));
+  ASSERT_FALSE(TryParseFloat("    "));
+  ASSERT_FALSE(TryParseFloat(""));
+  ASSERT_FALSE(TryParseFloat("    abcd"));
+
+  v = "   1e8   ";
+  ASSERT_EQ(*TryParseFloat(v.c_str()), ParseResultAndPos<double>(1e8, v.c_str() + v.size() - 3));
+
+  ASSERT_EQ(*ParseFloat("1.23"), 1.23);
+  ASSERT_EQ(*ParseFloat("1.23e2"), 1.23e2);
+  ASSERT_FALSE(ParseFloat("1.2 "));
+  ASSERT_FALSE(ParseFloat("1.2hello"));
 }

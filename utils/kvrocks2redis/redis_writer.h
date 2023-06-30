@@ -31,7 +31,11 @@
 
 class RedisWriter : public Writer {
  public:
-  explicit RedisWriter(Kvrocks2redis::Config *config);
+  explicit RedisWriter(kvrocks2redis::Config *config);
+
+  RedisWriter(const RedisWriter &) = delete;
+  RedisWriter &operator=(const RedisWriter &) = delete;
+
   ~RedisWriter();
   Status Write(const std::string &ns, const std::vector<std::string> &aofs) override;
   Status FlushDB(const std::string &ns) override;

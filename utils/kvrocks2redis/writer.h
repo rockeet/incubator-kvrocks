@@ -30,7 +30,11 @@
 
 class Writer {
  public:
-  explicit Writer(Kvrocks2redis::Config *config) : config_(config) {}
+  explicit Writer(kvrocks2redis::Config *config) : config_(config) {}
+
+  Writer(const Writer &) = delete;
+  Writer &operator=(const Writer &) = delete;
+
   ~Writer();
   virtual Status Write(const std::string &ns, const std::vector<std::string> &aofs);
   virtual Status FlushDB(const std::string &ns);
@@ -40,6 +44,6 @@ class Writer {
   std::string GetAofFilePath(const std::string &ns);
 
  protected:
-  Kvrocks2redis::Config *config_ = nullptr;
+  kvrocks2redis::Config *config_ = nullptr;
   std::map<std::string, int> aof_fds_;
 };

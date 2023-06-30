@@ -67,13 +67,13 @@ func TestClusterNodes(t *testing.T) {
 
 	nodeID := "07c37dfeb235213a872192d90877d0cd55635b91"
 	require.NoError(t, rdb.Do(ctx, "clusterx", "SETNODEID", nodeID).Err())
+	clusterNodes := fmt.Sprintf("%s %s %d master - 0-100", nodeID, srv.Host(), srv.Port())
 
 	t.Run("basic function of cluster", func(t *testing.T) {
 		// cluster is not initialized
 		util.ErrorRegexp(t, rdb.ClusterNodes(ctx).Err(), ".*CLUSTERDOWN.*not initialized.*")
 
 		// set cluster nodes info
-		clusterNodes := fmt.Sprintf("%s %s %d master - 0-100", nodeID, srv.Host(), srv.Port())
 		require.NoError(t, rdb.Do(ctx, "clusterx", "SETNODES", clusterNodes, "2").Err())
 		require.EqualValues(t, "2", rdb.Do(ctx, "clusterx", "version").Val())
 
@@ -91,6 +91,20 @@ func TestClusterNodes(t *testing.T) {
 		require.EqualValues(t, 0, slots[0].Start)
 		require.EqualValues(t, 100, slots[0].End)
 		require.EqualValues(t, []redis.ClusterNode{{ID: nodeID, Addr: srv.HostPort()}}, slots[0].Nodes)
+	})
+
+	t.Run("enable/disable the persist cluster nodes", func(t *testing.T) {
+		require.NoError(t, rdb.ConfigSet(ctx, "persist-cluster-nodes-enabled", "yes").Err())
+		srv.Restart()
+		require.EqualValues(t, "2", rdb.Do(ctx, "clusterx", "version").Val())
+
+		require.NoError(t, rdb.ConfigSet(ctx, "persist-cluster-nodes-enabled", "no").Err())
+		srv.Restart()
+		require.EqualValues(t, "-1", rdb.Do(ctx, "clusterx", "version").Val())
+
+		// reset the cluster topology to avoid breaking other test cases
+		require.NoError(t, rdb.Do(ctx, "clusterx", "SETNODES", clusterNodes, "2").Err())
+		require.EqualValues(t, "2", rdb.Do(ctx, "clusterx", "version").Val())
 	})
 
 	t.Run("cluster topology is reset by old version", func(t *testing.T) {
@@ -114,6 +128,65 @@ func TestClusterNodes(t *testing.T) {
 		require.ErrorContains(t, rdb.Do(ctx, "clusterx", "setslot", "16384", "07c37dfeb235213a872192d90877d0cd55635b91", 1).Err(), "CLUSTER")
 		require.ErrorContains(t, rdb.Do(ctx, "clusterx", "setslot", "16384", "a", 1).Err(), "CLUSTER")
 	})
+}
+
+func TestClusterDumpAndLoadClusterNodesInfo(t *testing.T) {
+	srv1 := util.StartServer(t, map[string]string{
+		"bind":            "0.0.0.0",
+		"cluster-enabled": "yes",
+	})
+	defer srv1.Close()
+	ctx := context.Background()
+	rdb1 := srv1.NewClient()
+	defer func() { require.NoError(t, rdb1.Close()) }()
+	nodeID1 := "07c37dfeb235213a872192d90877d0cd55635b91"
+	require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODEID", nodeID1).Err())
+
+	srv2 := util.StartServer(t, map[string]string{
+		"bind":            "0.0.0.0",
+		"cluster-enabled": "yes",
+	})
+	defer srv2.Close()
+	rdb2 := srv2.NewClient()
+	defer func() { require.NoError(t, rdb2.Close()) }()
+	nodeID2 := "07c37dfeb235213a872192d90877d0cd55635b92"
+	require.NoError(t, rdb2.Do(ctx, "clusterx", "SETNODEID", nodeID2).Err())
+
+	clusterNodes := fmt.Sprintf("%s %s %d master - ", nodeID1, srv1.Host(), srv1.Port())
+	clusterNodes += "0-1 2 4-8191 8192 8193 10000 10002-11002 16381 16382-16383\n"
+	clusterNodes += fmt.Sprintf("%s %s %d master -", nodeID2, srv2.Host(), srv2.Port())
+
+	require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+	require.NoError(t, rdb2.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+
+	srv1.Restart()
+	slots := rdb1.ClusterSlots(ctx).Val()
+	require.Len(t, slots, 5)
+	require.EqualValues(t, 10000, slots[2].Start)
+	require.EqualValues(t, 10000, slots[2].End)
+	require.EqualValues(t, []redis.ClusterNode{{ID: nodeID1, Addr: srv1.HostPort()}}, slots[2].Nodes)
+	nodes := rdb1.ClusterNodes(ctx).Val()
+	require.Contains(t, nodes, "0-2 4-8193 10000 10002-11002 16381-16383")
+
+	newNodeID := "0123456789012345678901234567890123456789"
+	require.NoError(t, rdb2.Do(ctx, "clusterx", "SETNODEID", newNodeID).Err())
+	srv1.Restart()
+	slots = rdb1.ClusterSlots(ctx).Val()
+	require.EqualValues(t, 10000, slots[2].Start)
+	require.EqualValues(t, 10000, slots[2].End)
+	nodes = rdb1.ClusterNodes(ctx).Val()
+	require.Contains(t, nodes, "0-2 4-8193 10000 10002-11002 16381-16383")
+
+	require.NoError(t, rdb2.Do(ctx, "clusterx", "setslot", "0", "node", nodeID2, "2").Err())
+	require.NoError(t, rdb1.Do(ctx, "clusterx", "setslot", "0", "node", nodeID2, "2").Err())
+
+	srv1.Restart()
+	srv2.Restart()
+	nodes = rdb1.ClusterNodes(ctx).Val()
+
+	require.Regexp(t, ".*myself,master.*1-2 4-8193 10000 10002-11002 16381-16383.*", nodes)
+	nodes = rdb2.ClusterNodes(ctx).Val()
+	require.Contains(t, nodes, "1-2 4-8193 10000 10002-11002 16381-16383")
 }
 
 func TestClusterComplexTopology(t *testing.T) {
@@ -182,21 +255,21 @@ func TestClusterSlotSet(t *testing.T) {
 
 	require.NoError(t, rdb2.Set(ctx, slotKey, 0, 0).Err())
 	util.ErrorRegexp(t, rdb1.Set(ctx, slotKey, 0, 0).Err(), fmt.Sprintf(".*MOVED 0.*%d.*", srv2.Port()))
-	require.NoError(t, rdb2.Do(ctx, "clusterx", "setslot", "1", "node", nodeID2, "4").Err())
-	require.NoError(t, rdb1.Do(ctx, "clusterx", "setslot", "1", "node", nodeID2, "4").Err())
+	require.NoError(t, rdb2.Do(ctx, "clusterx", "setslot", "1-3 4", "node", nodeID2, "4").Err())
+	require.NoError(t, rdb1.Do(ctx, "clusterx", "setslot", "1-3 4", "node", nodeID2, "4").Err())
 	slots = rdb2.ClusterSlots(ctx).Val()
 	require.EqualValues(t, slots, rdb1.ClusterSlots(ctx).Val())
 	require.Len(t, slots, 2)
 	require.EqualValues(t, 0, slots[0].Start)
-	require.EqualValues(t, 1, slots[0].End)
+	require.EqualValues(t, 4, slots[0].End)
 	require.EqualValues(t, []redis.ClusterNode{{ID: nodeID2, Addr: srv2.HostPort()}}, slots[0].Nodes)
-	require.EqualValues(t, 2, slots[1].Start)
+	require.EqualValues(t, 5, slots[1].Start)
 	require.EqualValues(t, 16383, slots[1].End)
 	require.EqualValues(t, []redis.ClusterNode{{ID: nodeID1, Addr: srv1.HostPort()}}, slots[1].Nodes)
 
 	// wrong version can't update slot distribution
-	require.ErrorContains(t, rdb2.Do(ctx, "clusterx", "setslot", "2", "node", nodeID2, "6").Err(), "version")
-	require.ErrorContains(t, rdb2.Do(ctx, "clusterx", "setslot", "2", "node", nodeID2, "4").Err(), "version")
+	require.ErrorContains(t, rdb2.Do(ctx, "clusterx", "setslot", "4", "node", nodeID2, "6").Err(), "version")
+	require.ErrorContains(t, rdb2.Do(ctx, "clusterx", "setslot", "4", "node", nodeID2, "4").Err(), "version")
 	require.EqualValues(t, "4", rdb2.Do(ctx, "clusterx", "version").Val())
 	require.EqualValues(t, "4", rdb1.Do(ctx, "clusterx", "version").Val())
 }

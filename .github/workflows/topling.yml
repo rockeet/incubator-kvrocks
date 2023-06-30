@@ -1,0 +1,52 @@
+name: kvrocks-topling docker
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ unstable ]
+    paths-ignore:
+      - '**/*.md'
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: azure/docker-login@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+          submodules: true
+      
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{secrets.DOCKER_ORG}}/kvrocks-topling
+          flavor: latest=false
+          tags: |
+            type=sha,prefix=nightly-{{date 'YYYYMMDD'}}-,format=short
+            type=raw,value=nightly
+      
+      # - name: Set up QEMU
+      #   uses: docker/setup-qemu-action@v2
+
+      # - name: Set up Docker Buildx
+      #   id: buildx
+      #   uses: docker/setup-buildx-action@v2
+      
+      - uses: docker/build-push-action@v4
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          file: 'topling.dockerfile'
+

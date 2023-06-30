@@ -35,7 +35,7 @@
 
 // forward declaration
 class Server;
-namespace Engine {
+namespace engine {
 class Storage;
 }
 
@@ -51,14 +51,14 @@ constexpr const size_t MiB = 1024L * KiB;
 constexpr const size_t GiB = 1024L * MiB;
 constexpr const uint32_t kDefaultPort = 6666;
 
-extern const char *kDefaultNamespace;
+constexpr const char *kDefaultNamespace = "__namespace";
 
 struct CompactionCheckerRange {
  public:
-  int Start;
-  int Stop;
+  int start;
+  int stop;
 
-  bool Enabled() { return Start != -1 || Stop != -1; }
+  bool Enabled() const { return start != -1 || stop != -1; }
 };
 
 struct CLIOptions {
@@ -90,7 +90,7 @@ struct Config {
   int tls_session_cache_timeout = 300;
   int workers = 0;
   int timeout = 0;
-  int loglevel = 0;
+  int log_level = 0;
   int backlog = 511;
   int maxclients = 10000;
   int max_backup_to_keep = 1;
@@ -131,14 +131,20 @@ struct Config {
   Cron compact_cron;
   Cron bgsave_cron;
   CompactionCheckerRange compaction_checker_range{-1, -1};
+  int64_t force_compact_file_age;
+  int force_compact_file_min_deleted_percentage;
   std::map<std::string, std::string> tokens;
+  std::string replica_announce_ip;
+  uint32_t replica_announce_port = 0;
 
+  bool persist_cluster_nodes_enabled = true;
   bool slot_id_encoded = false;
   bool cluster_enabled = false;
   int migrate_speed;
   int pipeline_size;
   int sequence_gap;
 
+  int log_retention_days;
   // profiling
   int profiling_sample_ratio = 0;
   int profiling_sample_record_threshold_ms = 0;
@@ -164,8 +170,8 @@ struct Config {
     int64_t delayed_write_rate;
     int compaction_readahead_size;
     int target_file_size_base;
-    int WAL_ttl_seconds;
-    int WAL_size_limit_MB;
+    int wal_ttl_seconds;
+    int wal_size_limit_mb;
     int max_total_wal_size;
     int level0_slowdown_writes_trigger;
     int level0_stop_writes_trigger;
@@ -180,19 +186,25 @@ struct Config {
     int max_bytes_for_level_base;
     int max_bytes_for_level_multiplier;
     bool level_compaction_dynamic_level_bytes;
+    int max_background_jobs;
+    bool rate_limiter_auto_tuned;
 
     struct WriteOptions {
       bool sync;
-      bool disable_WAL;
+      bool disable_wal;
       bool no_slowdown;
       bool low_pri;
       bool memtable_insert_hint_per_batch;
     } write_options;
-  } RocksDB;
 
-  mutable std::mutex backup_mu_;
+    struct ReadOptions {
+      bool async_io;
+    } read_options;
+  } rocks_db;
 
- public:
+  mutable std::mutex backup_mu;
+
+  std::string NodesFilePath() const;
   Status Rewrite();
   Status Load(const CLIOptions &path);
   void Get(const std::string &key, std::vector<std::string> *values);
@@ -206,12 +218,12 @@ struct Config {
 
  private:
   std::string path_;
-  std::string binds_;
+  std::string binds_str_;
   std::string slaveof_;
-  std::string compact_cron_;
-  std::string bgsave_cron_;
-  std::string compaction_checker_range_;
-  std::string profiling_sample_commands_;
+  std::string compact_cron_str_;
+  std::string bgsave_cron_str_;
+  std::string compaction_checker_range_str_;
+  std::string profiling_sample_commands_str_;
   std::map<std::string, std::unique_ptr<ConfigField>> fields_;
   std::vector<std::string> rename_command_;
 
@@ -220,5 +232,5 @@ struct Config {
   Status parseConfigFromPair(const std::pair<std::string, std::string> &input, int line_number);
   Status parseConfigFromString(const std::string &input, int line_number);
   Status finish();
-  Status isNamespaceLegal(const std::string &ns);
+  static Status isNamespaceLegal(const std::string &ns);
 };

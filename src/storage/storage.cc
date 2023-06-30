@@ -30,7 +30,6 @@
 #include <rocksdb/sst_file_manager.h>
 #include <rocksdb/utilities/checkpoint.h>
 #include <rocksdb/utilities/table_properties_collectors.h>
-#include <sys/stat.h>
 
 #include <algorithm>
 #include <iostream>
@@ -38,58 +37,45 @@
 #include <random>
 
 #include "compact_filter.h"
-#include "config.h"
 #include "event_listener.h"
 #include "event_util.h"
-#include "fd_util.h"
 #include "redis_db.h"
 #include "redis_metadata.h"
 #include "rocksdb_crc32c.h"
 #include "server/server.h"
 #include "table_properties_collector.h"
 #include "time_util.h"
+#include "unique_fd.h"
 
-namespace Engine {
+namespace engine {
 
-const char *kPubSubColumnFamilyName = "pubsub";
-const char *kZSetScoreColumnFamilyName = "zset_score";
-const char *kMetadataColumnFamilyName = "metadata";
-const char *kSubkeyColumnFamilyName = "default";
-const char *kPropagateColumnFamilyName = "propagate";
-const char *kStreamColumnFamilyName = "stream";
-
-const char *kPropagateScriptCommand = "script";
-
-const char *kLuaFunctionPrefix = "lua_f_";
-
-const char *kReplicationIdKey = "replication_id_";
+constexpr const char *kReplicationIdKey = "replication_id_";
 
 const int64_t kIORateLimitMaxMb = 1024000;
 
 using rocksdb::Slice;
 
-Storage::Storage(Config *config) : env_(rocksdb::Env::Default()), config_(config), lock_mgr_(16) {
+Storage::Storage(Config *config)
+    : backup_creating_time_(util::GetTimeStamp()), env_(rocksdb::Env::Default()), config_(config), lock_mgr_(16) {
   Metadata::InitVersionCounter();
-  SetCheckpointCreateTime(0);
-  SetCheckpointAccessTime(0);
-  backup_creating_time_ = Util::GetTimeStamp();
-  SetWriteOptions(config->RocksDB.write_options);
+  SetWriteOptions(config->rocks_db.write_options);
 }
 
 Storage::~Storage() {
-  if (backup_ != nullptr) {
-    DestroyBackup();
-  }
+  DestroyBackup();
   CloseDB();
 }
 
 void Storage::CloseDB() {
   auto guard = WriteLockGuard();
-  if (db_ == nullptr) return;
+  if (!db_) return;
 
   db_closing_ = true;
   db_->SyncWAL();
   rocksdb::CancelAllBackgroundWork(db_, true);
+#ifdef KVROCKS_USE_TOPLINGDB
+  repo_.CloseAllDB(false);
+#endif
   for (auto handle : cf_handles_) db_->DestroyColumnFamilyHandle(handle);
   delete db_;
   db_ = nullptr;
@@ -97,10 +83,15 @@ void Storage::CloseDB() {
 
 void Storage::SetWriteOptions(const Config::RocksDB::WriteOptions &config) {
   write_opts_.sync = config.sync;
-  write_opts_.disableWAL = config.disable_WAL;
+  write_opts_.disableWAL = config.disable_wal;
   write_opts_.no_slowdown = config.no_slowdown;
   write_opts_.low_pri = config.low_pri;
   write_opts_.memtable_insert_hint_per_batch = config.memtable_insert_hint_per_batch;
+}
+
+void Storage::SetReadOptions(rocksdb::ReadOptions &read_options) {
+  read_options.fill_cache = false;
+  read_options.async_io = config_->rocks_db.read_options.async_io;
 }
 
 rocksdb::BlockBasedTableOptions Storage::InitTableOptions() {
@@ -113,21 +104,21 @@ rocksdb::BlockBasedTableOptions Storage::InitTableOptions() {
   table_options.metadata_block_size = 4096;
   table_options.data_block_index_type = rocksdb::BlockBasedTableOptions::DataBlockIndexType::kDataBlockBinaryAndHash;
   table_options.data_block_hash_table_util_ratio = 0.75;
-  table_options.block_size = static_cast<size_t>(config_->RocksDB.block_size);
+  table_options.block_size = static_cast<size_t>(config_->rocks_db.block_size);
   return table_options;
 }
 
 void Storage::SetBlobDB(rocksdb::ColumnFamilyOptions *cf_options) {
-  cf_options->enable_blob_files = config_->RocksDB.enable_blob_files;
-  cf_options->min_blob_size = config_->RocksDB.min_blob_size;
-  cf_options->blob_file_size = config_->RocksDB.blob_file_size;
-  cf_options->blob_compression_type = static_cast<rocksdb::CompressionType>(config_->RocksDB.compression);
-  cf_options->enable_blob_garbage_collection = config_->RocksDB.enable_blob_garbage_collection;
+  cf_options->enable_blob_files = config_->rocks_db.enable_blob_files;
+  cf_options->min_blob_size = config_->rocks_db.min_blob_size;
+  cf_options->blob_file_size = config_->rocks_db.blob_file_size;
+  cf_options->blob_compression_type = static_cast<rocksdb::CompressionType>(config_->rocks_db.compression);
+  cf_options->enable_blob_garbage_collection = config_->rocks_db.enable_blob_garbage_collection;
   // Use 100.0 to force converting blob_garbage_collection_age_cutoff to double
-  cf_options->blob_garbage_collection_age_cutoff = config_->RocksDB.blob_garbage_collection_age_cutoff / 100.0;
+  cf_options->blob_garbage_collection_age_cutoff = config_->rocks_db.blob_garbage_collection_age_cutoff / 100.0;
 }
 
-rocksdb::Options Storage::InitOptions() {
+rocksdb::Options Storage::InitRocksDBOptions() {
   rocksdb::Options options;
   options.create_if_missing = true;
   options.create_missing_column_families = true;
@@ -135,15 +126,15 @@ rocksdb::Options Storage::InitOptions() {
   // NOTE: the overhead of statistics is 5%-10%, so it should be configurable in prod env
   // See: https://github.com/facebook/rocksdb/wiki/Statistics
   options.statistics = rocksdb::CreateDBStatistics();
-  options.stats_dump_period_sec = config_->RocksDB.stats_dump_period_sec;
-  options.max_open_files = config_->RocksDB.max_open_files;
+  options.stats_dump_period_sec = config_->rocks_db.stats_dump_period_sec;
+  options.max_open_files = config_->rocks_db.max_open_files;
   options.compaction_style = rocksdb::CompactionStyle::kCompactionStyleLevel;
-  options.max_subcompactions = static_cast<uint32_t>(config_->RocksDB.max_sub_compactions);
-  options.max_background_flushes = config_->RocksDB.max_background_flushes;
-  options.max_background_compactions = config_->RocksDB.max_background_compactions;
-  options.max_write_buffer_number = config_->RocksDB.max_write_buffer_number;
+  options.max_subcompactions = static_cast<uint32_t>(config_->rocks_db.max_sub_compactions);
+  options.max_background_flushes = config_->rocks_db.max_background_flushes;
+  options.max_background_compactions = config_->rocks_db.max_background_compactions;
+  options.max_write_buffer_number = config_->rocks_db.max_write_buffer_number;
   options.min_write_buffer_number_to_merge = 2;
-  options.write_buffer_size = config_->RocksDB.write_buffer_size * MiB;
+  options.write_buffer_size = config_->rocks_db.write_buffer_size * MiB;
   options.num_levels = 7;
   options.compression_per_level.resize(options.num_levels);
   // only compress levels >= 2
@@ -151,58 +142,63 @@ rocksdb::Options Storage::InitOptions() {
     if (i < 2) {
       options.compression_per_level[i] = rocksdb::CompressionType::kNoCompression;
     } else {
-      options.compression_per_level[i] = static_cast<rocksdb::CompressionType>(config_->RocksDB.compression);
+      options.compression_per_level[i] = static_cast<rocksdb::CompressionType>(config_->rocks_db.compression);
     }
   }
-  if (config_->RocksDB.row_cache_size) {
-    options.row_cache = rocksdb::NewLRUCache(config_->RocksDB.row_cache_size * MiB);
+  if (config_->rocks_db.row_cache_size) {
+    options.row_cache = rocksdb::NewLRUCache(config_->rocks_db.row_cache_size * MiB);
   }
-  options.enable_pipelined_write = config_->RocksDB.enable_pipelined_write;
-  options.target_file_size_base = config_->RocksDB.target_file_size_base * MiB;
+  options.enable_pipelined_write = config_->rocks_db.enable_pipelined_write;
+  options.target_file_size_base = config_->rocks_db.target_file_size_base * MiB;
   options.max_manifest_file_size = 64 * MiB;
   options.max_log_file_size = 256 * MiB;
   options.keep_log_file_num = 12;
-  options.WAL_ttl_seconds = static_cast<uint64_t>(config_->RocksDB.WAL_ttl_seconds);
-  options.WAL_size_limit_MB = static_cast<uint64_t>(config_->RocksDB.WAL_size_limit_MB);
-  options.max_total_wal_size = static_cast<uint64_t>(config_->RocksDB.max_total_wal_size * MiB);
+  options.WAL_ttl_seconds = static_cast<uint64_t>(config_->rocks_db.wal_ttl_seconds);
+  options.WAL_size_limit_MB = static_cast<uint64_t>(config_->rocks_db.wal_size_limit_mb);
+  options.max_total_wal_size = static_cast<uint64_t>(config_->rocks_db.max_total_wal_size * MiB);
   options.listeners.emplace_back(new EventListener(this));
   options.dump_malloc_stats = true;
   sst_file_manager_ = std::shared_ptr<rocksdb::SstFileManager>(rocksdb::NewSstFileManager(rocksdb::Env::Default()));
   options.sst_file_manager = sst_file_manager_;
   int64_t max_io_mb = kIORateLimitMaxMb;
   if (config_->max_io_mb > 0) max_io_mb = config_->max_io_mb;
-  rate_limiter_ =
-      std::shared_ptr<rocksdb::RateLimiter>(rocksdb::NewGenericRateLimiter(max_io_mb * static_cast<int64_t>(MiB)));
+
+  rate_limiter_ = std::shared_ptr<rocksdb::RateLimiter>(rocksdb::NewGenericRateLimiter(
+      max_io_mb * static_cast<int64_t>(MiB), 100 * 1000, /* default */
+      10,                                                /* default */
+      rocksdb::RateLimiter::Mode::kWritesOnly, config_->rocks_db.rate_limiter_auto_tuned));
+
   options.rate_limiter = rate_limiter_;
-  options.delayed_write_rate = static_cast<uint64_t>(config_->RocksDB.delayed_write_rate);
-  options.compaction_readahead_size = static_cast<size_t>(config_->RocksDB.compaction_readahead_size);
-  options.level0_slowdown_writes_trigger = config_->RocksDB.level0_slowdown_writes_trigger;
-  options.level0_stop_writes_trigger = config_->RocksDB.level0_stop_writes_trigger;
-  options.level0_file_num_compaction_trigger = config_->RocksDB.level0_file_num_compaction_trigger;
-  options.max_bytes_for_level_base = config_->RocksDB.max_bytes_for_level_base;
-  options.max_bytes_for_level_multiplier = config_->RocksDB.max_bytes_for_level_multiplier;
-  options.level_compaction_dynamic_level_bytes = config_->RocksDB.level_compaction_dynamic_level_bytes;
+  options.delayed_write_rate = static_cast<uint64_t>(config_->rocks_db.delayed_write_rate);
+  options.compaction_readahead_size = static_cast<size_t>(config_->rocks_db.compaction_readahead_size);
+  options.level0_slowdown_writes_trigger = config_->rocks_db.level0_slowdown_writes_trigger;
+  options.level0_stop_writes_trigger = config_->rocks_db.level0_stop_writes_trigger;
+  options.level0_file_num_compaction_trigger = config_->rocks_db.level0_file_num_compaction_trigger;
+  options.max_bytes_for_level_base = config_->rocks_db.max_bytes_for_level_base;
+  options.max_bytes_for_level_multiplier = config_->rocks_db.max_bytes_for_level_multiplier;
+  options.level_compaction_dynamic_level_bytes = config_->rocks_db.level_compaction_dynamic_level_bytes;
+  options.max_background_jobs = config_->rocks_db.max_background_jobs;
 
   return options;
 }
 
-Status Storage::SetColumnFamilyOption(const std::string &key, const std::string &value) {
+Status Storage::SetOptionForAllColumnFamilies(const std::string &key, const std::string &value) {
   for (auto &cf_handle : cf_handles_) {
     auto s = db_->SetOptions(cf_handle, {{key, value}});
-    if (!s.ok()) return Status(Status::NotOK, s.ToString());
+    if (!s.ok()) return {Status::NotOK, s.ToString()};
   }
   return Status::OK();
 }
 
 Status Storage::SetOption(const std::string &key, const std::string &value) {
   auto s = db_->SetOptions({{key, value}});
-  if (!s.ok()) return Status(Status::NotOK, s.ToString());
+  if (!s.ok()) return {Status::NotOK, s.ToString()};
   return Status::OK();
 }
 
 Status Storage::SetDBOption(const std::string &key, const std::string &value) {
   auto s = db_->SetDBOptions({{key, value}});
-  if (!s.ok()) return Status(Status::NotOK, s.ToString());
+  if (!s.ok()) return {Status::NotOK, s.ToString()};
   return Status::OK();
 }
 
@@ -217,41 +213,54 @@ Status Storage::CreateColumnFamilies(const rocksdb::Options &options) {
     s = tmp_db->CreateColumnFamilies(cf_options, cf_names, &cf_handles);
     if (!s.ok()) {
       delete tmp_db;
-      return Status(Status::DBOpenErr, s.ToString());
+      return {Status::DBOpenErr, s.ToString()};
     }
+
     for (auto handle : cf_handles) tmp_db->DestroyColumnFamilyHandle(handle);
     tmp_db->Close();
     delete tmp_db;
   }
 
   if (!s.ok()) {
-    // We try to create families by opening the db without column families.
-    // If it's ok means we didn't create column families(cannot open without column families if created).
+    // We try to create column families by opening the database without column families.
+    // If it's ok means we didn't create column families (cannot open without column families if created).
     // When goes wrong, we need to check whether it's caused by column families NOT being opened or not.
     // If the status message contains `Column families not opened` means that we have created the column
     // families, let's ignore the error.
-    std::string notOpenedPrefix = "Column families not opened";
-    if (s.IsInvalidArgument() && s.ToString().find(notOpenedPrefix) != std::string::npos) {
+    std::string not_opened_prefix = "Column families not opened";
+    if (s.IsInvalidArgument() && s.ToString().find(not_opened_prefix) != std::string::npos) {
       return Status::OK();
     }
-    return Status(Status::NotOK, s.ToString());
+
+    return {Status::NotOK, s.ToString()};
   }
+
   return Status::OK();
 }
 
 Status Storage::Open(bool read_only) {
+  if (const char *topling_conf = getenv("TOPLING_CONF")) {
+    return openTopling(topling_conf);
+  } else {
+    return openRocks(read_only);
+  }
+}
+
+Status Storage::openRocks(bool read_only) {
   auto guard = WriteLockGuard();
   db_closing_ = false;
 
-  bool cache_index_and_filter_blocks = config_->RocksDB.cache_index_and_filter_blocks;
-  size_t metadata_block_cache_size = config_->RocksDB.metadata_block_cache_size * MiB;
-  size_t subkey_block_cache_size = config_->RocksDB.subkey_block_cache_size * MiB;
+  bool cache_index_and_filter_blocks = config_->rocks_db.cache_index_and_filter_blocks;
+  size_t metadata_block_cache_size = config_->rocks_db.metadata_block_cache_size * MiB;
+  size_t subkey_block_cache_size = config_->rocks_db.subkey_block_cache_size * MiB;
 
-  rocksdb::Options options = InitOptions();
-  CreateColumnFamilies(options);
+  rocksdb::Options options = InitRocksDBOptions();
+  if (auto s = CreateColumnFamilies(options); !s.IsOK()) {
+    return s.Prefixed("failed to create column families");
+  }
 
   std::shared_ptr<rocksdb::Cache> shared_block_cache;
-  if (config_->RocksDB.share_metadata_and_subkey_block_cache) {
+  if (config_->rocks_db.share_metadata_and_subkey_block_cache) {
     size_t shared_block_cache_size = metadata_block_cache_size + subkey_block_cache_size;
     shared_block_cache = rocksdb::NewLRUCache(shared_block_cache_size, -1, false, 0.75);
   }
@@ -266,7 +275,7 @@ Status Storage::Open(bool read_only) {
   rocksdb::ColumnFamilyOptions metadata_opts(options);
   metadata_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(metadata_table_opts));
   metadata_opts.compaction_filter_factory = std::make_shared<MetadataFilterFactory>(this);
-  metadata_opts.disable_auto_compactions = config_->RocksDB.disable_auto_compactions;
+  metadata_opts.disable_auto_compactions = config_->rocks_db.disable_auto_compactions;
   // Enable whole key bloom filter in memtable
   metadata_opts.memtable_whole_key_filtering = true;
   metadata_opts.memtable_prefix_bloom_size_ratio = 0.1;
@@ -283,7 +292,7 @@ Status Storage::Open(bool read_only) {
   rocksdb::ColumnFamilyOptions subkey_opts(options);
   subkey_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(subkey_table_opts));
   subkey_opts.compaction_filter_factory = std::make_shared<SubKeyFilterFactory>(this);
-  subkey_opts.disable_auto_compactions = config_->RocksDB.disable_auto_compactions;
+  subkey_opts.disable_auto_compactions = config_->rocks_db.disable_auto_compactions;
   subkey_opts.table_properties_collector_factories.emplace_back(
       NewCompactOnExpiredTableCollectorFactory(kSubkeyColumnFamilyName, 0.3));
   SetBlobDB(&subkey_opts);
@@ -292,14 +301,14 @@ Status Storage::Open(bool read_only) {
   rocksdb::ColumnFamilyOptions pubsub_opts(options);
   pubsub_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(pubsub_table_opts));
   pubsub_opts.compaction_filter_factory = std::make_shared<PubSubFilterFactory>();
-  pubsub_opts.disable_auto_compactions = config_->RocksDB.disable_auto_compactions;
+  pubsub_opts.disable_auto_compactions = config_->rocks_db.disable_auto_compactions;
   SetBlobDB(&pubsub_opts);
 
   rocksdb::BlockBasedTableOptions propagate_table_opts = InitTableOptions();
   rocksdb::ColumnFamilyOptions propagate_opts(options);
   propagate_opts.table_factory.reset(rocksdb::NewBlockBasedTableFactory(propagate_table_opts));
   propagate_opts.compaction_filter_factory = std::make_shared<PropagateFilterFactory>();
-  propagate_opts.disable_auto_compactions = config_->RocksDB.disable_auto_compactions;
+  propagate_opts.disable_auto_compactions = config_->rocks_db.disable_auto_compactions;
   SetBlobDB(&propagate_opts);
 
   std::vector<rocksdb::ColumnFamilyDescriptor> column_families;
@@ -310,9 +319,11 @@ Status Storage::Open(bool read_only) {
   column_families.emplace_back(kPubSubColumnFamilyName, pubsub_opts);
   column_families.emplace_back(kPropagateColumnFamilyName, propagate_opts);
   column_families.emplace_back(kStreamColumnFamilyName, subkey_opts);
+
   std::vector<std::string> old_column_families;
   auto s = rocksdb::DB::ListColumnFamilies(options, config_->db_dir, &old_column_families);
-  if (!s.ok()) return Status(Status::NotOK, s.ToString());
+  if (!s.ok()) return {Status::NotOK, s.ToString()};
+
   auto start = std::chrono::high_resolution_clock::now();
   if (read_only) {
     s = rocksdb::DB::OpenForReadOnly(options, config_->db_dir, column_families, &cf_handles_, &db_);
@@ -323,15 +334,55 @@ Status Storage::Open(bool read_only) {
   int64_t duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
   if (!s.ok()) {
     LOG(INFO) << "[storage] Failed to load the data from disk: " << duration << " ms";
-    return Status(Status::DBOpenErr, s.ToString());
+    return {Status::DBOpenErr, s.ToString()};
   }
+
   LOG(INFO) << "[storage] Success to load the data from disk: " << duration << " ms";
   return Status::OK();
 }
 
+Status Storage::openTopling(const char *conf) {
+#ifdef KVROCKS_USE_TOPLINGDB
+  using rocksdb::CompactionFilterFactory;
+  using std::make_shared;
+  using std::shared_ptr;
+  repo_.Put("metadata", R"({"class": "MetadataFilterFactory", "params": {"storage": "this"}})",
+            shared_ptr<CompactionFilterFactory>(make_shared<MetadataFilterFactory>(this)));
+  repo_.Put("subkey", R"({"class": "SubKeyFilterFactory", "params": {"storage": "this"}})",
+            shared_ptr<CompactionFilterFactory>(make_shared<SubKeyFilterFactory>(this)));
+  repo_.Put("listener", R"({"class": "EventListener", "params": {"storage": "this"}})",
+            shared_ptr<rocksdb::EventListener>(make_shared<EventListener>(this)));
+  auto s = repo_.ImportAutoFile(conf);
+  if (!s.ok()) {
+    LOG(ERROR) << "[storage] FAIL repo_.ImportAutoFile(" << conf << ") = " << s.ToString();
+    return Status(Status::DBOpenErr, "repo_.ImportAutoFile");
+  }
+  auto start = std::chrono::high_resolution_clock::now();
+  rocksdb::DB_MultiCF *dbm = nullptr;
+  s = repo_.OpenDB(&dbm);
+  if (!s.ok()) {
+    LOG(ERROR) << "[storage] FAIL repo_.OpenDB() = " << s.ToString();
+    return Status(Status::DBOpenErr, "repo_.OpenDB");
+  }
+  db_ = dbm->db;
+  cf_handles_ = dbm->cf_handles;
+  auto end = std::chrono::high_resolution_clock::now();
+  int64_t duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+  LOG(INFO) << "[storage] Success to load the data from disk: " << duration << " ms";
+  LOG(INFO) << "[storage] StartHttpServer ...";
+  s = repo_.StartHttpServer();
+  if (!s.ok()) {
+    LOG(INFO) << "[storage] StartHttpServer ... Failed";
+  }
+  return Status::OK();
+#else
+  return Status(Status::DBOpenErr, "Not compiled with ToplingDB, DO NOT start with env TOPLING_CONF");
+#endif
+}
+
 Status Storage::CreateBackup() {
   LOG(INFO) << "[storage] Start to create new backup";
-  std::lock_guard<std::mutex> lg(config_->backup_mu_);
+  std::lock_guard<std::mutex> lg(config_->backup_mu);
   std::string task_backup_dir = config_->backup_dir;
 
   std::string tmpdir = task_backup_dir + ".tmp";
@@ -342,40 +393,47 @@ Status Storage::CreateBackup() {
   rocksdb::Checkpoint *checkpoint = nullptr;
   rocksdb::Status s = rocksdb::Checkpoint::Create(db_, &checkpoint);
   if (!s.ok()) {
-    LOG(WARNING) << "Fail to create checkpoint for backup, error:" << s.ToString();
-    return Status(Status::NotOK, s.ToString());
+    LOG(WARNING) << "Failed to create checkpoint object for backup. Error: " << s.ToString();
+    return {Status::NotOK, s.ToString()};
   }
+
   std::unique_ptr<rocksdb::Checkpoint> checkpoint_guard(checkpoint);
-  s = checkpoint->CreateCheckpoint(tmpdir, config_->RocksDB.write_buffer_size * MiB);
+  s = checkpoint->CreateCheckpoint(tmpdir, config_->rocks_db.write_buffer_size * MiB);
   if (!s.ok()) {
-    LOG(WARNING) << "Fail to create checkpoint for backup, error:" << s.ToString();
-    return Status(Status::DBBackupErr, s.ToString());
+    LOG(WARNING) << "Failed to create checkpoint (snapshot) for backup. Error: " << s.ToString();
+    return {Status::DBBackupErr, s.ToString()};
   }
 
   // 2) Rename tmp backup to real backup dir
-  if (!(s = rocksdb::DestroyDB(task_backup_dir, rocksdb::Options())).ok()) {
-    LOG(WARNING) << "[storage] Fail to clean old backup, error:" << s.ToString();
-    return Status(Status::NotOK, s.ToString());
+  if (s = rocksdb::DestroyDB(task_backup_dir, rocksdb::Options()); !s.ok()) {
+    LOG(WARNING) << "[storage] Failed to clean old backup. Error: " << s.ToString();
+    return {Status::NotOK, s.ToString()};
   }
-  if (!(s = env_->RenameFile(tmpdir, task_backup_dir)).ok()) {
-    LOG(WARNING) << "[storage] Fail to rename tmp backup, error:" << s.ToString();
+
+  if (s = env_->RenameFile(tmpdir, task_backup_dir); !s.ok()) {
+    LOG(WARNING) << "[storage] Failed to rename tmp backup. Error: " << s.ToString();
     // Just try best effort
-    if (!(s = rocksdb::DestroyDB(tmpdir, rocksdb::Options())).ok()) {
-      LOG(WARNING) << "[storage] Fail to clean tmp backup, error:" << s.ToString();
+    if (s = rocksdb::DestroyDB(tmpdir, rocksdb::Options()); !s.ok()) {
+      LOG(WARNING) << "[storage] Failed to clean tmp backup. Error: " << s.ToString();
     }
-    return Status(Status::NotOK, s.ToString());
+
+    return {Status::NotOK, s.ToString()};
   }
+
   // 'backup_mu_' can guarantee 'backup_creating_time_' is thread-safe
-  backup_creating_time_ = static_cast<time_t>(Util::GetTimeStamp());
+  backup_creating_time_ = static_cast<time_t>(util::GetTimeStamp());
 
   LOG(INFO) << "[storage] Success to create new backup";
   return Status::OK();
 }
 
-Status Storage::DestroyBackup() {
+void Storage::DestroyBackup() {
+  if (!backup_) {
+    return;
+  }
   backup_->StopBackup();
   delete backup_;
-  return Status();
+  backup_ = nullptr;
 }
 
 Status Storage::RestoreFromBackup() {
@@ -383,72 +441,80 @@ Status Storage::RestoreFromBackup() {
   // We must reopen the backup engine every time, as the files is changed
   rocksdb::BackupEngineOptions bk_option(config_->backup_sync_dir);
   auto s = rocksdb::BackupEngine::Open(db_->GetEnv(), bk_option, &backup_);
-  if (!s.ok()) return Status(Status::DBBackupErr, s.ToString());
+  if (!s.ok()) return {Status::DBBackupErr, s.ToString()};
 
   s = backup_->RestoreDBFromLatestBackup(config_->db_dir, config_->db_dir);
   if (!s.ok()) {
-    LOG(ERROR) << "[storage] Failed to restore: " << s.ToString();
+    LOG(ERROR) << "[storage] Failed to restore database from the latest backup. Error: " << s.ToString();
   } else {
-    LOG(INFO) << "[storage] Restore from backup";
+    LOG(INFO) << "[storage] Database was restored from the latest backup";
   }
-  // Reopen DB （should always try to reopen db even if restore failed , replication sst file crc check may use it）
+
+  // Reopen DB （should always try to reopen db even if restore failed, replication SST file CRC check may use it）
   auto s2 = Open();
   if (!s2.IsOK()) {
-    LOG(ERROR) << "[storage] Failed to reopen db: " << s2.Msg();
-    return Status(Status::DBOpenErr, s2.Msg());
+    LOG(ERROR) << "[storage] Failed to reopen the database. Error: " << s2.Msg();
+    return {Status::DBOpenErr, s2.Msg()};
   }
 
   // Clean up backup engine
   backup_->PurgeOldBackups(0);
   DestroyBackup();
-  backup_ = nullptr;
 
   return s.ok() ? Status::OK() : Status(Status::DBBackupErr, s.ToString());
 }
 
 Status Storage::RestoreFromCheckpoint() {
-  std::string dir = config_->sync_checkpoint_dir;
+  std::string checkpoint_dir = config_->sync_checkpoint_dir;
   std::string tmp_dir = config_->db_dir + ".tmp";
 
   // Clean old backups and checkpoints because server will work on the new db
   PurgeOldBackups(0, 0);
   rocksdb::DestroyDB(config_->checkpoint_dir, rocksdb::Options());
 
-  // Maybe there is no db dir
+  // Maybe there is no database directory
   auto s = env_->CreateDirIfMissing(config_->db_dir);
   if (!s.ok()) {
-    return Status(Status::NotOK, "Fail to create db dir, error: " + s.ToString());
+    return {Status::NotOK,
+            fmt::format("Failed to create database directory '{}'. Error: {}", config_->db_dir, s.ToString())};
   }
 
-  // Rename db dir to tmp, so we can restore if replica fails to load
-  // the checkpoint from master.
+  // Rename database directory to tmp, so we can restore if replica fails to load the checkpoint from master.
   // But only try best effort to make data safe
   s = env_->RenameFile(config_->db_dir, tmp_dir);
   if (!s.ok()) {
-    if (!Open().IsOK()) LOG(ERROR) << "[storage] Fail to reopen db";
-    return Status(Status::NotOK, "Fail to rename db dir, error: " + s.ToString());
+    if (auto s1 = Open(); !s1.IsOK()) {
+      LOG(ERROR) << "[storage] Failed to reopen database. Error: " << s1.Msg();
+    }
+    return {Status::NotOK, fmt::format("Failed to rename database directory '{}' to '{}'. Error: {}", config_->db_dir,
+                                       tmp_dir, s.ToString())};
   }
 
-  // Rename checkpoint dir to db dir
-  if (!(s = env_->RenameFile(dir, config_->db_dir)).ok()) {
+  // Rename checkpoint directory to database directory
+  if (s = env_->RenameFile(checkpoint_dir, config_->db_dir); !s.ok()) {
     env_->RenameFile(tmp_dir, config_->db_dir);
-    if (!Open().IsOK()) LOG(ERROR) << "[storage] Fail to reopen db";
-    return Status(Status::NotOK, "Fail to rename checkpoint dir, error: " + s.ToString());
+    if (auto s1 = Open(); !s1.IsOK()) {
+      LOG(ERROR) << "[storage] Failed to reopen database. Error: " << s1.Msg();
+    }
+    return {Status::NotOK, fmt::format("Failed to rename checkpoint directory '{}' to '{}'. Error: {}", checkpoint_dir,
+                                       config_->db_dir, s.ToString())};
   }
 
-  // Open the new db, restore if replica fails to open db
+  // Open the new database, restore if replica fails to open
   auto s2 = Open();
   if (!s2.IsOK()) {
-    LOG(WARNING) << "[storage] Fail to open master checkpoint, error: " << s2.Msg();
+    LOG(WARNING) << "[storage] Failed to open master checkpoint. Error: " << s2.Msg();
     rocksdb::DestroyDB(config_->db_dir, rocksdb::Options());
     env_->RenameFile(tmp_dir, config_->db_dir);
-    if (!Open().IsOK()) LOG(ERROR) << "[storage] Fail to reopen db";
-    return Status(Status::DBOpenErr, "Fail to open master checkpoint, error: " + s2.Msg());
+    if (auto s1 = Open(); !s1.IsOK()) {
+      LOG(ERROR) << "[storage] Failed to reopen database. Error: " << s1.Msg();
+    }
+    return {Status::DBOpenErr, "Failed to open master checkpoint. Error: " + s2.Msg()};
   }
 
-  // Destory origin db
-  if (!(s = rocksdb::DestroyDB(tmp_dir, rocksdb::Options())).ok()) {
-    LOG(WARNING) << "[storage] Fail to destroy " << tmp_dir << ", error:" << s.ToString();
+  // Destroy the origin database
+  if (s = rocksdb::DestroyDB(tmp_dir, rocksdb::Options()); !s.ok()) {
+    LOG(WARNING) << "[storage] Failed to destroy the origin database at '" << tmp_dir << "'. Error: " << s.ToString();
   }
   return Status::OK();
 }
@@ -460,13 +526,13 @@ void Storage::EmptyDB() {
 
   auto s = rocksdb::DestroyDB(config_->db_dir, rocksdb::Options());
   if (!s.ok()) {
-    LOG(ERROR) << "[storage] Failed to destroy db, error: " << s.ToString();
+    LOG(ERROR) << "[storage] Failed to destroy database. Error: " << s.ToString();
   }
 }
 
 void Storage::PurgeOldBackups(uint32_t num_backups_to_keep, uint32_t backup_max_keep_hours) {
-  time_t now = time(nullptr);
-  std::lock_guard<std::mutex> lg(config_->backup_mu_);
+  time_t now = util::GetTimeStamp();
+  std::lock_guard<std::mutex> lg(config_->backup_mu);
   std::string task_backup_dir = config_->backup_dir;
 
   // Return if there is no backup
@@ -474,28 +540,74 @@ void Storage::PurgeOldBackups(uint32_t num_backups_to_keep, uint32_t backup_max_
   if (!s.ok()) return;
 
   // No backup is needed to keep or the backup is expired, we will clean it.
-  if (num_backups_to_keep == 0 ||
-      (backup_max_keep_hours != 0 && backup_creating_time_ + backup_max_keep_hours * 3600 < now)) {
+  bool backup_expired = (backup_max_keep_hours != 0 && backup_creating_time_ + backup_max_keep_hours * 3600 < now);
+  if (num_backups_to_keep == 0 || backup_expired) {
     s = rocksdb::DestroyDB(task_backup_dir, rocksdb::Options());
     if (s.ok()) {
-      LOG(INFO) << "[storage] Succeeded cleaning old backup that was born at " << backup_creating_time_;
+      LOG(INFO) << "[storage] Succeeded cleaning old backup that was created at " << backup_creating_time_;
     } else {
-      LOG(INFO) << "[storage] Failed cleaning old backup that was born at " << backup_creating_time_;
+      LOG(INFO) << "[storage] Failed cleaning old backup that was created at " << backup_creating_time_
+                << ". Error: " << s.ToString();
     }
   }
 }
 
 Status Storage::GetWALIter(rocksdb::SequenceNumber seq, std::unique_ptr<rocksdb::TransactionLogIterator> *iter) {
   auto s = db_->GetUpdatesSince(seq, iter);
-  if (!s.ok()) return Status(Status::DBGetWALErr, s.ToString());
-  if (!(*iter)->Valid()) return Status(Status::DBGetWALErr, "iterator not valid");
+  if (!s.ok()) return {Status::DBGetWALErr, s.ToString()};
+
+  if (!(*iter)->Valid()) return {Status::DBGetWALErr, "iterator is not valid"};
+
   return Status::OK();
 }
 
-rocksdb::SequenceNumber Storage::LatestSeq() { return db_->GetLatestSequenceNumber(); }
+rocksdb::SequenceNumber Storage::LatestSeqNumber() { return db_->GetLatestSequenceNumber(); }
+
+rocksdb::Status Storage::Get(const rocksdb::ReadOptions &options, const rocksdb::Slice &key, std::string *value) {
+  return Get(options, db_->DefaultColumnFamily(), key, value);
+}
+
+rocksdb::Status Storage::Get(const rocksdb::ReadOptions &options, rocksdb::ColumnFamilyHandle *column_family,
+                             const rocksdb::Slice &key, std::string *value) {
+  if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
+    return txn_write_batch_->GetFromBatchAndDB(db_, options, column_family, key, value);
+  }
+  return db_->Get(options, column_family, key, value);
+}
+
+rocksdb::Iterator *Storage::NewIterator(const rocksdb::ReadOptions &options) {
+  return NewIterator(options, db_->DefaultColumnFamily());
+}
+
+rocksdb::Iterator *Storage::NewIterator(const rocksdb::ReadOptions &options,
+                                        rocksdb::ColumnFamilyHandle *column_family) {
+  auto iter = db_->NewIterator(options, column_family);
+  if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
+    return txn_write_batch_->NewIteratorWithBase(column_family, iter, &options);
+  }
+  return iter;
+}
+
+void Storage::MultiGet(const rocksdb::ReadOptions &options, rocksdb::ColumnFamilyHandle *column_family,
+                       const size_t num_keys, const rocksdb::Slice *keys, rocksdb::PinnableSlice *values,
+                       rocksdb::Status *statuses) {
+  if (is_txn_mode_ && txn_write_batch_->GetWriteBatch()->Count() > 0) {
+    txn_write_batch_->MultiGetFromBatchAndDB(db_, options, column_family, num_keys, keys, values, statuses, false);
+  } else {
+    db_->MultiGet(options, column_family, num_keys, keys, values, statuses, false);
+  }
+}
 
 rocksdb::Status Storage::Write(const rocksdb::WriteOptions &options, rocksdb::WriteBatch *updates) {
-  if (reach_db_size_limit_) {
+  if (is_txn_mode_) {
+    // The batch won't be flushed until the transaction was committed or rollback
+    return rocksdb::Status::OK();
+  }
+  return writeToDB(options, updates);
+}
+
+rocksdb::Status Storage::writeToDB(const rocksdb::WriteOptions &options, rocksdb::WriteBatch *updates) {
+  if (db_size_limit_reached_) {
     return rocksdb::Status::SpaceLimit();
   }
 
@@ -509,23 +621,25 @@ rocksdb::Status Storage::Write(const rocksdb::WriteOptions &options, rocksdb::Wr
 
 rocksdb::Status Storage::Delete(const rocksdb::WriteOptions &options, rocksdb::ColumnFamilyHandle *cf_handle,
                                 const rocksdb::Slice &key) {
-  rocksdb::WriteBatch batch;
-  batch.Delete(cf_handle, key);
-  return Write(options, &batch);
+  auto batch = GetWriteBatchBase();
+  batch->Delete(cf_handle, key);
+  return Write(options, batch->GetWriteBatch());
 }
 
 rocksdb::Status Storage::DeleteRange(const std::string &first_key, const std::string &last_key) {
-  rocksdb::WriteBatch batch;
-  rocksdb::ColumnFamilyHandle *cf_handle = GetCFHandle("metadata");
-  auto s = batch.DeleteRange(cf_handle, first_key, last_key);
+  auto batch = GetWriteBatchBase();
+  rocksdb::ColumnFamilyHandle *cf_handle = GetCFHandle(kMetadataColumnFamilyName);
+  auto s = batch->DeleteRange(cf_handle, first_key, last_key);
   if (!s.ok()) {
     return s;
   }
-  s = batch.Delete(cf_handle, last_key);
+
+  s = batch->Delete(cf_handle, last_key);
   if (!s.ok()) {
     return s;
   }
-  return Write(write_opts_, &batch);
+
+  return Write(write_opts_, batch->GetWriteBatch());
 }
 
 rocksdb::Status Storage::FlushScripts(const rocksdb::WriteOptions &options, rocksdb::ColumnFamilyHandle *cf_handle) {
@@ -534,23 +648,26 @@ rocksdb::Status Storage::FlushScripts(const rocksdb::WriteOptions &options, rock
   // didn't contain the end key.
   end_key[end_key.size() - 1] += 1;
 
-  rocksdb::WriteBatch batch;
-  auto s = batch.DeleteRange(cf_handle, begin_key, end_key);
+  auto batch = GetWriteBatchBase();
+  auto s = batch->DeleteRange(cf_handle, begin_key, end_key);
   if (!s.ok()) {
     return s;
   }
-  return Write(options, &batch);
+
+  return Write(options, batch->GetWriteBatch());
 }
 
 Status Storage::ReplicaApplyWriteBatch(std::string &&raw_batch) {
-  if (reach_db_size_limit_) {
-    return Status(Status::NotOK, "reach space limit");
+  if (db_size_limit_reached_) {
+    return {Status::NotOK, "reach space limit"};
   }
-  auto bat = rocksdb::WriteBatch(std::move(raw_batch));
-  auto s = db_->Write(write_opts_, &bat);
+
+  auto batch = rocksdb::WriteBatch(std::move(raw_batch));
+  auto s = db_->Write(write_opts_, &batch);
   if (!s.ok()) {
-    return Status(Status::NotOK, s.ToString());
+    return {Status::NotOK, s.ToString()};
   }
+
   return Status::OK();
 }
 
@@ -583,17 +700,20 @@ uint64_t Storage::GetTotalSize(const std::string &ns) {
   if (ns == kDefaultNamespace) {
     return sst_file_manager_->GetTotalSize();
   }
+
   std::string prefix, begin_key, end_key;
   ComposeNamespaceKey(ns, "", &prefix, false);
 
-  Redis::Database db(this, ns);
+  redis::Database db(this, ns);
   uint64_t size = 0, total_size = 0;
   rocksdb::DB::SizeApproximationFlags include_both =
       rocksdb::DB::SizeApproximationFlags::INCLUDE_FILES | rocksdb::DB::SizeApproximationFlags::INCLUDE_MEMTABLES;
+
   for (auto cf_handle : cf_handles_) {
     if (cf_handle == GetCFHandle(kPubSubColumnFamilyName) || cf_handle == GetCFHandle(kPropagateColumnFamilyName)) {
       continue;
     }
+
     auto s = db.FindKeyRangeWithPrefix(prefix, std::string(), &begin_key, &end_key, cf_handle);
     if (!s.ok()) continue;
 
@@ -601,27 +721,27 @@ uint64_t Storage::GetTotalSize(const std::string &ns) {
     db_->GetApproximateSizes(cf_handle, &r, 1, &size, include_both);
     total_size += size;
   }
+
   return total_size;
 }
 
-Status Storage::CheckDBSizeLimit() {
-  bool reach_db_size_limit = false;
-  if (config_->max_db_size == 0) {
-    reach_db_size_limit = false;
+void Storage::CheckDBSizeLimit() {
+  bool limit_reached = false;
+  if (config_->max_db_size > 0) {
+    limit_reached = GetTotalSize() >= config_->max_db_size * GiB;
+  }
+
+  if (db_size_limit_reached_ == limit_reached) {
+    return;
+  }
+
+  db_size_limit_reached_ = limit_reached;
+  if (db_size_limit_reached_) {
+    LOG(WARNING) << "[storage] ENABLE db_size limit " << config_->max_db_size << " GB."
+                 << "Switch kvrocks to read-only mode.";
   } else {
-    reach_db_size_limit = GetTotalSize() >= config_->max_db_size * GiB;
+    LOG(WARNING) << "[storage] DISABLE db_size limit. Switch kvrocks to read-write mode.";
   }
-  if (reach_db_size_limit_ == reach_db_size_limit) {
-    return Status::OK();
-  }
-  reach_db_size_limit_ = reach_db_size_limit;
-  if (reach_db_size_limit_) {
-    LOG(WARNING) << "[storage] ENABLE db_size limit " << config_->max_db_size << " GB"
-                 << "set kvrocks to read-only mode";
-  } else {
-    LOG(WARNING) << "[storage] DISABLE db_size limit, set kvrocks to read-write mode ";
-  }
-  return Status::OK();
 }
 
 void Storage::SetIORateLimit(int64_t max_io_mb) {
@@ -633,24 +753,56 @@ void Storage::SetIORateLimit(int64_t max_io_mb) {
 
 rocksdb::DB *Storage::GetDB() { return db_; }
 
-Status Storage::WriteToPropagateCF(const std::string &key, const std::string &value) {
-  rocksdb::WriteBatch batch;
+Status Storage::BeginTxn() {
+  if (is_txn_mode_) {
+    return Status{Status::NotOK, "cannot begin a new transaction while already in transaction mode"};
+  }
+  // The EXEC command is exclusive and shouldn't have multi transaction at the same time,
+  // so it's fine to reset the global write batch without any lock.
+  is_txn_mode_ = true;
+  txn_write_batch_ = std::make_unique<rocksdb::WriteBatchWithIndex>();
+  return Status::OK();
+}
 
+Status Storage::CommitTxn() {
+  if (!is_txn_mode_) {
+    return Status{Status::NotOK, "cannot commit while not in transaction mode"};
+  }
+
+  auto s = writeToDB(write_opts_, txn_write_batch_->GetWriteBatch());
+
+  is_txn_mode_ = false;
+  txn_write_batch_ = nullptr;
+  if (s.ok()) {
+    return Status::OK();
+  }
+  return {Status::NotOK, s.ToString()};
+}
+
+ObserverOrUniquePtr<rocksdb::WriteBatchBase> Storage::GetWriteBatchBase() {
+  if (is_txn_mode_) {
+    return ObserverOrUniquePtr<rocksdb::WriteBatchBase>(txn_write_batch_.get(), ObserverOrUnique::Observer);
+  }
+  return ObserverOrUniquePtr<rocksdb::WriteBatchBase>(new rocksdb::WriteBatch(), ObserverOrUnique::Unique);
+}
+
+Status Storage::WriteToPropagateCF(const std::string &key, const std::string &value) {
+  auto batch = GetWriteBatchBase();
   auto cf = GetCFHandle(kPropagateColumnFamilyName);
-  batch.Put(cf, key, value);
-  auto s = Write(write_opts_, &batch);
+  batch->Put(cf, key, value);
+  auto s = Write(write_opts_, batch->GetWriteBatch());
   if (!s.ok()) {
-    return Status(Status::NotOK, s.ToString());
+    return {Status::NotOK, s.ToString()};
   }
   return Status::OK();
 }
 
-bool Storage::ShiftReplId() {
+Status Storage::ShiftReplId() {
   const char *charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const int charset_len = static_cast<int>(strlen(charset));
 
-  // Do nothing if don't enable rsid psync
-  if (!config_->use_rsid_psync) return true;
+  // Do nothing if rsid psync is not enabled
+  if (!config_->use_rsid_psync) return Status::OK();
 
   std::random_device rd;
   std::mt19937 gen(rd() + getpid());
@@ -663,8 +815,7 @@ bool Storage::ShiftReplId() {
   LOG(INFO) << "[replication] New replication id: " << replid_;
 
   // Write new replication id into db engine
-  WriteToPropagateCF(kReplicationIdKey, replid_);
-  return true;
+  return WriteToPropagateCF(kReplicationIdKey, replid_);
 }
 
 std::string Storage::GetReplIdFromWalBySeq(rocksdb::SequenceNumber seq) {
@@ -687,16 +838,17 @@ std::string Storage::GetReplIdFromWalBySeq(rocksdb::SequenceNumber seq) {
     }
 
     void LogData(const rocksdb::Slice &blob) override {
-      // Currently, we alway put replid log data at the last.
+      // Currently, we always put replid log data at the end.
       if (ServerLogData::IsServerLogData(blob.data())) {
-        ServerLogData serverlog;
-        if (serverlog.Decode(blob).IsOK()) {
-          if (serverlog.GetType() == kReplIdLog) {
-            replid_in_wal_ = serverlog.GetContent();
+        ServerLogData server_log;
+        if (server_log.Decode(blob).IsOK()) {
+          if (server_log.GetType() == kReplIdLog) {
+            replid_in_wal_ = server_log.GetContent();
           }
         }
       }
     };
+
     std::string GetReplId() { return replid_in_wal_; }
 
    private:
@@ -707,6 +859,7 @@ std::string Storage::GetReplIdFromWalBySeq(rocksdb::SequenceNumber seq) {
   ReplIdExtractor write_batch_handler;
   rocksdb::Status s = batch.writeBatchPtr->Iterate(&write_batch_handler);
   if (!s.ok()) return "";
+
   return write_batch_handler.GetReplId();
 }
 
@@ -717,15 +870,13 @@ std::string Storage::GetReplIdFromDbEngine() {
   return replid_in_db;
 }
 
-std::unique_ptr<RWLock::ReadLock> Storage::ReadLockGuard() { return std::make_unique<RWLock::ReadLock>(db_rw_lock_); }
+std::shared_lock<std::shared_mutex> Storage::ReadLockGuard() { return std::shared_lock(db_rw_lock_); }
 
-std::unique_ptr<RWLock::WriteLock> Storage::WriteLockGuard() {
-  return std::make_unique<RWLock::WriteLock>(db_rw_lock_);
-}
+std::unique_lock<std::shared_mutex> Storage::WriteLockGuard() { return std::unique_lock(db_rw_lock_); }
 
 Status Storage::ReplDataManager::GetFullReplDataInfo(Storage *storage, std::string *files) {
   auto guard = storage->ReadLockGuard();
-  if (storage->IsClosing()) return Status(Status::NotOK, "DB is closing");
+  if (storage->IsClosing()) return {Status::NotOK, "DB is closing"};
 
   std::string data_files_dir = storage->config_->checkpoint_dir;
   std::unique_lock<std::mutex> ulm(storage->checkpoint_mu_);
@@ -735,34 +886,48 @@ Status Storage::ReplDataManager::GetFullReplDataInfo(Storage *storage, std::stri
     rocksdb::Checkpoint *checkpoint = nullptr;
     rocksdb::Status s = rocksdb::Checkpoint::Create(storage->db_, &checkpoint);
     if (!s.ok()) {
-      LOG(WARNING) << "Fail to create checkpoint, error:" << s.ToString();
-      return Status(Status::NotOK, s.ToString());
+      LOG(WARNING) << "Failed to create checkpoint object. Error: " << s.ToString();
+      return {Status::NotOK, s.ToString()};
     }
+
     std::unique_ptr<rocksdb::Checkpoint> checkpoint_guard(checkpoint);
 
     // Create checkpoint of rocksdb
-    s = checkpoint->CreateCheckpoint(data_files_dir, storage->config_->RocksDB.write_buffer_size * MiB);
-    auto now = static_cast<time_t>(Util::GetTimeStamp());
-    storage->SetCheckpointCreateTime(now);
-    storage->SetCheckpointAccessTime(now);
+    uint64_t checkpoint_latest_seq = 0;
+    s = checkpoint->CreateCheckpoint(data_files_dir, storage->config_->rocks_db.write_buffer_size * MiB,
+                                     &checkpoint_latest_seq);
+    auto now = static_cast<time_t>(util::GetTimeStamp());
+    storage->checkpoint_info_.create_time = now;
+    storage->checkpoint_info_.access_time = now;
+    storage->checkpoint_info_.latest_seq = checkpoint_latest_seq;
     if (!s.ok()) {
-      LOG(WARNING) << "[storage] Fail to create checkpoint, error:" << s.ToString();
-      return Status(Status::NotOK, s.ToString());
+      LOG(WARNING) << "[storage] Failed to create checkpoint (snapshot). Error: " << s.ToString();
+      return {Status::NotOK, s.ToString()};
     }
+
     LOG(INFO) << "[storage] Create checkpoint successfully";
   } else {
-    // Replicas can share checkpiont to replication if the checkpoint existing
-    // time is less half of WAL ttl.
-    int64_t can_shared_time = storage->config_->RocksDB.WAL_ttl_seconds / 2;
+    // Replicas can share checkpoint to replication if the checkpoint existing time is less than a half of WAL TTL.
+    int64_t can_shared_time = storage->config_->rocks_db.wal_ttl_seconds / 2;
     if (can_shared_time > 60 * 60) can_shared_time = 60 * 60;
     if (can_shared_time < 10 * 60) can_shared_time = 10 * 60;
-    auto now = static_cast<time_t>(Util::GetTimeStamp());
+
+    auto now = static_cast<time_t>(util::GetTimeStamp());
     if (now - storage->GetCheckpointCreateTime() > can_shared_time) {
       LOG(WARNING) << "[storage] Can't use current checkpoint, waiting next checkpoint";
-      return Status(Status::NotOK, "Can't use current checkpoint, waiting for next checkpoint");
+      return {Status::NotOK, "Can't use current checkpoint, waiting for next checkpoint"};
     }
-    LOG(INFO) << "[storage] Use current existing checkpoint";
+
+    // Should not use current checkpoint if its latest sequence was out of the WAL boundary,
+    // or the slave will fall into the full sync loop since it won't create new checkpoint.
+    auto s = storage->InWALBoundary(storage->checkpoint_info_.latest_seq);
+    if (!s.IsOK()) {
+      LOG(WARNING) << "[storage] Can't use current checkpoint, error: " << s.Msg();
+      return {Status::NotOK, fmt::format("Can't use current checkpoint, error: {}", s.Msg())};
+    }
+    LOG(INFO) << "[storage] Using current existing checkpoint";
   }
+
   ulm.unlock();
 
   // Get checkpoint file list
@@ -770,10 +935,12 @@ Status Storage::ReplDataManager::GetFullReplDataInfo(Storage *storage, std::stri
   storage->env_->GetChildren(data_files_dir, &result);
   for (const auto &f : result) {
     if (f == "." || f == "..") continue;
+
     files->append(f);
     files->push_back(',');
   }
   files->pop_back();
+
   return Status::OK();
 }
 
@@ -783,6 +950,17 @@ bool Storage::ExistCheckpoint() {
 }
 
 bool Storage::ExistSyncCheckpoint() { return env_->FileExists(config_->sync_checkpoint_dir).ok(); }
+
+Status Storage::InWALBoundary(rocksdb::SequenceNumber seq) {
+  std::unique_ptr<rocksdb::TransactionLogIterator> iter;
+  auto s = GetWALIter(seq, &iter);
+  if (!s.IsOK()) return s;
+  auto wal_seq = iter->GetBatch().sequence;
+  if (seq < wal_seq) {
+    return {Status::NotOK, fmt::format("checkpoint seq: {} is smaller than the WAL seq: {}", seq, wal_seq)};
+  }
+  return Status::OK();
+}
 
 Status Storage::ReplDataManager::CleanInvalidFiles(Storage *storage, const std::string &dir,
                                                    std::vector<std::string> valid_files) {
@@ -811,7 +989,7 @@ Status Storage::ReplDataManager::CleanInvalidFiles(Storage *storage, const std::
     auto s = storage->env_->DeleteFile(dir + "/" + *it);
     if (!s.ok()) {
       ret = Status(Status::NotOK, s.ToString());
-      LOG(INFO) << "[storage] Fail to delete invalid file " << *it << " of master checkpoint";
+      LOG(INFO) << "[storage] Failed to delete invalid file " << *it << " of master checkpoint";
     } else {
       LOG(INFO) << "[storage] Succeed deleting invalid file " << *it << " of master checkpoint";
     }
@@ -826,18 +1004,18 @@ int Storage::ReplDataManager::OpenDataFile(Storage *storage, const std::string &
     LOG(ERROR) << "[storage] Data file [" << abs_path << "] not found";
     return NullFD;
   }
+
   storage->env_->GetFileSize(abs_path, file_size);
   auto rv = open(abs_path.c_str(), O_RDONLY);
   if (rv < 0) {
     LOG(ERROR) << "[storage] Failed to open file: " << strerror(errno);
   }
+
   return rv;
 }
 
-Storage::ReplDataManager::MetaInfo Storage::ReplDataManager::ParseMetaAndSave(Storage *storage,
-                                                                              rocksdb::BackupID meta_id,
-                                                                              evbuffer *evbuf) {
-  Storage::ReplDataManager::MetaInfo meta;
+Status Storage::ReplDataManager::ParseMetaAndSave(Storage *storage, rocksdb::BackupID meta_id, evbuffer *evbuf,
+                                                  Storage::ReplDataManager::MetaInfo *meta) {
   auto meta_file = "meta/" + std::to_string(meta_id);
   DLOG(INFO) << "[meta] id: " << meta_id;
 
@@ -850,16 +1028,16 @@ Storage::ReplDataManager::MetaInfo Storage::ReplDataManager::ParseMetaAndSave(St
   // timestamp;
   UniqueEvbufReadln line(evbuf, EVBUFFER_EOL_LF);
   DLOG(INFO) << "[meta] timestamp: " << line.get();
-  meta.timestamp = std::strtoll(line.get(), nullptr, 10);
+  meta->timestamp = std::strtoll(line.get(), nullptr, 10);
   // sequence
   line = UniqueEvbufReadln(evbuf, EVBUFFER_EOL_LF);
   DLOG(INFO) << "[meta] seq:" << line.get();
-  meta.seq = std::strtoull(line.get(), nullptr, 10);
+  meta->seq = std::strtoull(line.get(), nullptr, 10);
   // optional metadata
   line = UniqueEvbufReadln(evbuf, EVBUFFER_EOL_LF);
   if (strncmp(line.get(), "metadata", 8) == 0) {
     DLOG(INFO) << "[meta] meta: " << line.get();
-    meta.meta_data = std::string(line.get(), line.length);
+    meta->meta_data = std::string(line.get(), line.length);
     line = UniqueEvbufReadln(evbuf, EVBUFFER_EOL_LF);
   }
   DLOG(INFO) << "[meta] file count: " << line.get();
@@ -869,18 +1047,21 @@ Storage::ReplDataManager::MetaInfo Storage::ReplDataManager::ParseMetaAndSave(St
     if (!line) {
       break;
     }
+
     DLOG(INFO) << "[meta] file info: " << line.get();
     auto cptr = line.get();
     while (*(cptr++) != ' ') {
     }
+
     auto filename = std::string(line.get(), cptr - line.get() - 1);
     while (*(cptr++) != ' ') {
     }
+
     auto crc32 = std::strtoul(cptr, nullptr, 10);
-    meta.files.emplace_back(filename, crc32);
+    meta->files.emplace_back(filename, crc32);
   }
-  SwapTmpFile(storage, storage->config_->backup_sync_dir, meta_file);
-  return meta;
+
+  return SwapTmpFile(storage, storage->config_->backup_sync_dir, meta_file);
 }
 
 Status MkdirRecursively(rocksdb::Env *env, const std::string &dir) {
@@ -889,13 +1070,15 @@ Status MkdirRecursively(rocksdb::Env *env, const std::string &dir) {
   std::string parent;
   for (auto pos = dir.find('/', 1); pos != std::string::npos; pos = dir.find('/', pos + 1)) {
     parent = dir.substr(0, pos);
-    if (!env->CreateDirIfMissing(parent).ok()) {
-      LOG(ERROR) << "[storage] Failed to create directory recursively";
-      return Status(Status::NotOK);
+    if (auto s = env->CreateDirIfMissing(parent); !s.ok()) {
+      LOG(ERROR) << "[storage] Failed to create directory '" << parent << "' recursively. Error: " << s.ToString();
+      return {Status::NotOK};
     }
   }
+
   if (env->CreateDirIfMissing(dir).ok()) return Status::OK();
-  return Status(Status::NotOK);
+
+  return {Status::NotOK};
 }
 
 std::unique_ptr<rocksdb::WritableFile> Storage::ReplDataManager::NewTmpFile(Storage *storage, const std::string &dir,
@@ -906,26 +1089,32 @@ std::unique_ptr<rocksdb::WritableFile> Storage::ReplDataManager::NewTmpFile(Stor
     LOG(ERROR) << "[storage] Data file exists, override";
     storage->env_->DeleteFile(tmp_file);
   }
+
   // Create directory if missing
   auto abs_dir = tmp_file.substr(0, tmp_file.rfind('/'));
   if (!MkdirRecursively(storage->env_, abs_dir).IsOK()) {
     return nullptr;
   }
+
   std::unique_ptr<rocksdb::WritableFile> wf;
   s = storage->env_->NewWritableFile(tmp_file, &wf, rocksdb::EnvOptions());
   if (!s.ok()) {
-    LOG(ERROR) << "[storage] Failed to create data file: " << s.ToString();
+    LOG(ERROR) << "[storage] Failed to create data file '" << tmp_file << "'. Error: " << s.ToString();
     return nullptr;
   }
+
   return wf;
 }
 
 Status Storage::ReplDataManager::SwapTmpFile(Storage *storage, const std::string &dir, const std::string &repl_file) {
   std::string tmp_file = dir + "/" + repl_file + ".tmp";
   std::string orig_file = dir + "/" + repl_file;
-  if (!storage->env_->RenameFile(tmp_file, orig_file).ok()) {
-    return Status(Status::NotOK, "unable to rename: " + tmp_file);
+
+  auto s = storage->env_->RenameFile(tmp_file, orig_file);
+  if (!s.ok()) {
+    return {Status::NotOK, fmt::format("unable to rename '{}' to '{}'. Error: {}", tmp_file, orig_file, s.ToString())};
   }
+
   return Status::OK();
 }
 
@@ -941,13 +1130,14 @@ bool Storage::ReplDataManager::FileExists(Storage *storage, const std::string &d
   if (crc == 0) return true;
 
   std::unique_ptr<rocksdb::SequentialFile> src_file;
-  const rocksdb::EnvOptions soptions;
-  s = storage->env_->NewSequentialFile(file_path, &src_file, soptions);
+  const rocksdb::EnvOptions env_options;
+  s = storage->env_->NewSequentialFile(file_path, &src_file, env_options);
   if (!s.ok()) return false;
 
   uint64_t size = 0;
   s = storage->env_->GetFileSize(file_path, &size);
   if (!s.ok()) return false;
+
   auto src_reader = std::make_unique<rocksdb::SequentialFileWrapper>(src_file.get());
 
   char buffer[4096];
@@ -957,11 +1147,14 @@ bool Storage::ReplDataManager::FileExists(Storage *storage, const std::string &d
     size_t bytes_to_read = std::min(sizeof(buffer), static_cast<size_t>(size));
     s = src_reader->Read(bytes_to_read, &slice, buffer);
     if (!s.ok()) return false;
+
     if (slice.size() == 0) return false;
+
     tmp_crc = rocksdb::crc32c::Extend(0, slice.ToString().c_str(), slice.size());
     size -= slice.size();
   }
+
   return crc == tmp_crc;
 }
 
-}  // namespace Engine
+}  // namespace engine

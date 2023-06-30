@@ -1,3 +1,5 @@
+//go:build !ignore_when_tsan
+
 /*
 * Licensed to the Apache Software Foundation (ASF) under one
 * or more contributor license agreements.  See the NOTICE file
@@ -16,7 +18,6 @@
 * specific language governing permissions and limitations
 * under the License.
  */
-
 package stream
 
 import (
@@ -61,7 +62,6 @@ func TestStream(t *testing.T) {
 	t.Run("XADD stores entry value with respect to case sensitivity", func(t *testing.T) {
 		require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: "myStream", Values: []string{"iTeM", "1", "vAluE", "a"}}).Err())
 		require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: "myStream", Values: []string{"ItEm", "2", "VaLUe", "B"}}).Err())
-
 		require.EqualValues(t, 2, rdb.XLen(ctx, "myStream").Val())
 
 		items := rdb.XRange(ctx, "myStream", "-", "+").Val()
@@ -228,8 +228,8 @@ func TestStream(t *testing.T) {
 		require.NoError(t, rdb.Del(ctx, "mystream").Err())
 		insertIntoStreamKey(t, rdb, "mystream")
 		items := rdb.XRange(ctx, "mystream", "-", "+").Val()
-		require.Len(t, items, 10000)
-		for i := 0; i < 10000; i++ {
+		require.Len(t, items, 1000)
+		for i := 0; i < 1000; i++ {
 			require.Subset(t, items[i].Values, map[string]interface{}{"item": strconv.Itoa(i)})
 		}
 	})
@@ -265,7 +265,7 @@ func TestStream(t *testing.T) {
 			}
 			lastID = streamNextID(t, items[len(items)-1].ID)
 		}
-		require.Equal(t, 10000, c)
+		require.Equal(t, 1000, c)
 	})
 
 	t.Run("XREVRANGE returns the reverse of XRANGE", func(t *testing.T) {
@@ -572,6 +572,113 @@ func TestStream(t *testing.T) {
 		require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: "mystream", MaxLen: 55, Values: map[string]interface{}{"xitem": "v"}}).Err())
 		require.EqualValues(t, 55, rdb.XLen(ctx, "mystream").Val())
 	})
+
+	t.Run("XLEN with optional parameters specifying the entry ID to start counting from and direction", func(t *testing.T) {
+		require.NoError(t, rdb.Del(ctx, "x").Err())
+
+		for i := 5; i <= 15; i++ {
+			require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{
+				Stream: "x",
+				ID:     fmt.Sprintf("%d-0", i),
+				Values: []string{"data", fmt.Sprintf("value-%d", i)},
+			}).Err())
+		}
+
+		r := rdb.Do(ctx, "XLEN", "x", "non-id")
+		require.ErrorContains(t, r.Err(), "Invalid stream ID")
+
+		r = rdb.Do(ctx, "XLEN", "x", "15-0")
+		val, err := r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 0, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "15-0", "+")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 0, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "15-0", "-")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 10, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "50-0")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 0, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "50-0", "+")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 0, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "50-0", "-")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 11, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "5-0")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 10, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "5-0", "+")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 10, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "5-0", "-")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 0, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "3-0")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 11, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "3-0", "+")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 11, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "3-0", "-")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 0, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "8-0")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 7, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "8-0", "+")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 7, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "8-0", "-")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 3, val)
+
+		require.NoError(t, rdb.XDel(ctx, "x", "8-0").Err())
+
+		r = rdb.Do(ctx, "XLEN", "x", "8-0")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 7, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "8-0", "+")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 7, val)
+
+		r = rdb.Do(ctx, "XLEN", "x", "8-0", "-")
+		val, err = r.Int()
+		require.NoError(t, err)
+		require.Equal(t, 3, val)
+	})
 }
 
 // streamSimulateXRANGE simulates Redis XRANGE implementation in Golang.
@@ -632,7 +739,7 @@ func streamNextID(t *testing.T, id string) string {
 func insertIntoStreamKey(t *testing.T, rdb *redis.Client, key string) {
 	ctx := context.Background()
 	require.NoError(t, rdb.Do(ctx, "MULTI").Err())
-	for i := 0; i < 10000; i++ {
+	for i := 0; i < 1000; i++ {
 		// From time to time insert a field with a different set
 		// of fields in order to stress the stream compression code.
 		if rand.Float64() < 0.9 {
@@ -729,4 +836,33 @@ func TestStreamOffset(t *testing.T) {
 		r = rdb.XInfoStreamFull(ctx, "x", 0).Val()
 		require.Equal(t, "2-0", r.MaxDeletedEntryID)
 	})
+
+	t.Run("XADD with custom sequence number and timestamp set by the server", func(t *testing.T) {
+		streamName := "test-stream-1"
+		require.NoError(t, rdb.Del(ctx, streamName).Err())
+
+		now := time.Now().UTC().UnixMilli()
+		providedSeqNum := 123456789
+		r, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: streamName,
+			ID:     fmt.Sprintf("*-%d", providedSeqNum),
+			Values: []string{"data", fmt.Sprintf("value-%d", providedSeqNum)},
+		}).Result()
+
+		require.NoError(t, err)
+
+		ts, seqNum := parseStreamEntryID(r)
+		require.GreaterOrEqual(t, ts, now)
+		require.Less(t, ts, now+5_000)
+		require.EqualValues(t, providedSeqNum, seqNum)
+	})
+}
+
+func parseStreamEntryID(id string) (ts int64, seqNum int64) {
+	values := strings.Split(id, "-")
+
+	ts, _ = strconv.ParseInt(values[0], 10, 64)
+	seqNum, _ = strconv.ParseInt(values[1], 10, 64)
+
+	return
 }

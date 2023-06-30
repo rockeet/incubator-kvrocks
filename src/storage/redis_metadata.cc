@@ -24,24 +24,22 @@
 #include <sys/time.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <ctime>
-#include <vector>
 
 #include "cluster/redis_slot.h"
+#include "encoding.h"
 #include "time_util.h"
 
 // 52 bit for microseconds and 11 bit for counter
 const int VersionCounterBits = 11;
 
-static std::atomic<uint64_t> version_counter_ = {0};
+static std::atomic<uint64_t> version_counter_ = 0;
 
-const char *kErrMsgWrongType = "WRONGTYPE Operation against a key holding the wrong kind of value";
-const char *kErrMsgKeyExpired = "the key was expired";
-const char *kErrMetadataTooShort = "metadata is too short";
+constexpr const char *kErrMetadataTooShort = "metadata is too short";
 
-InternalKey::InternalKey(Slice input, bool slot_id_encoded) {
-  slot_id_encoded_ = slot_id_encoded;
+InternalKey::InternalKey(Slice input, bool slot_id_encoded) : slot_id_encoded_(slot_id_encoded) {
   uint32_t key_size = 0;
   uint8_t namespace_size = 0;
   GetFixed8(&input, &namespace_size);
@@ -55,12 +53,10 @@ InternalKey::InternalKey(Slice input, bool slot_id_encoded) {
   input.remove_prefix(key_size);
   GetFixed64(&input, &version_);
   sub_key_ = Slice(input.data(), input.size());
-  buf_ = nullptr;
-  memset(prealloc_, '\0', sizeof(prealloc_));
 }
 
-InternalKey::InternalKey(Slice ns_key, Slice sub_key, uint64_t version, bool slot_id_encoded) {
-  slot_id_encoded_ = slot_id_encoded;
+InternalKey::InternalKey(Slice ns_key, Slice sub_key, uint64_t version, bool slot_id_encoded)
+    : slot_id_encoded_(slot_id_encoded) {
   uint8_t namespace_size = 0;
   GetFixed8(&ns_key, &namespace_size);
   namespace_ = Slice(ns_key.data(), namespace_size);
@@ -71,12 +67,6 @@ InternalKey::InternalKey(Slice ns_key, Slice sub_key, uint64_t version, bool slo
   key_ = ns_key;
   sub_key_ = sub_key;
   version_ = version;
-  buf_ = nullptr;
-  memset(prealloc_, '\0', sizeof(prealloc_));
-}
-
-InternalKey::~InternalKey() {
-  if (buf_ != nullptr && buf_ != prealloc_) delete[] buf_;
 }
 
 Slice InternalKey::GetNamespace() const { return namespace_; }
@@ -94,28 +84,24 @@ void InternalKey::Encode(std::string *out) {
   if (slot_id_encoded_) {
     total += 2;
   }
-  if (total < sizeof(prealloc_)) {
-    buf_ = prealloc_;
-  } else {
-    buf_ = new char[total];
-  }
-  EncodeFixed8(buf_ + pos, static_cast<uint8_t>(namespace_.size()));
+  out->resize(total);
+  auto buf = out->data();
+  EncodeFixed8(buf + pos, static_cast<uint8_t>(namespace_.size()));
   pos += 1;
-  memcpy(buf_ + pos, namespace_.data(), namespace_.size());
+  memcpy(buf + pos, namespace_.data(), namespace_.size());
   pos += namespace_.size();
   if (slot_id_encoded_) {
-    EncodeFixed16(buf_ + pos, slotid_);
+    EncodeFixed16(buf + pos, slotid_);
     pos += 2;
   }
-  EncodeFixed32(buf_ + pos, static_cast<uint32_t>(key_.size()));
+  EncodeFixed32(buf + pos, static_cast<uint32_t>(key_.size()));
   pos += 4;
-  memcpy(buf_ + pos, key_.data(), key_.size());
+  memcpy(buf + pos, key_.data(), key_.size());
   pos += key_.size();
-  EncodeFixed64(buf_ + pos, version_);
+  EncodeFixed64(buf + pos, version_);
   pos += 8;
-  memcpy(buf_ + pos, sub_key_.data(), sub_key_.size());
-  pos += sub_key_.size();
-  out->assign(buf_, pos);
+  memcpy(buf + pos, sub_key_.data(), sub_key_.size());
+  // pos += sub_key_.size();
 }
 
 bool InternalKey::operator==(const InternalKey &that) const {
@@ -145,7 +131,7 @@ void ComposeNamespaceKey(const Slice &ns, const Slice &key, std::string *ns_key,
   ns_key->append(ns.data(), ns.size());
 
   if (slot_id_encoded) {
-    auto slot_id = GetSlotNumFromKey(key.ToString());
+    auto slot_id = GetSlotIdFromKey(key.ToString());
     PutFixed16(ns_key, slot_id);
   }
 
@@ -161,50 +147,52 @@ void ComposeSlotKeyPrefix(const Slice &ns, int slotid, std::string *output) {
   PutFixed16(output, static_cast<uint16_t>(slotid));
 }
 
-Metadata::Metadata(RedisType type, bool generate_version) {
-  flags = (uint8_t)0x0f & type;
-  expire = 0;
-  version = 0;
-  size = 0;
-  if (generate_version) version = generateVersion();
-}
+Metadata::Metadata(RedisType type, bool generate_version, bool use_64bit_common_field)
+    : flags((use_64bit_common_field ? METADATA_64BIT_ENCODING_MASK : 0) | (METADATA_TYPE_MASK & type)),
+      expire(0),
+      version(generate_version ? generateVersion() : 0),
+      size(0) {}
 
 rocksdb::Status Metadata::Decode(const std::string &bytes) {
-  // flags(1byte) + expire (4byte)
-  if (bytes.size() < 5) {
+  Slice input(bytes);
+  if (!GetFixed8(&input, &flags)) {
     return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
   }
-  Slice input(bytes);
-  GetFixed8(&input, &flags);
-  GetFixed32(&input, reinterpret_cast<uint32_t *>(&expire));
-  if (Type() != kRedisString) {
-    if (input.size() < 12) return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
-    GetFixed64(&input, &version);
-    GetFixed32(&input, &size);
+
+  if (!GetExpire(&input)) {
+    return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
   }
+
+  if (Type() != kRedisString) {
+    if (input.size() < 8 + CommonEncodedSize()) {
+      return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+    }
+    GetFixed64(&input, &version);
+    GetFixedCommon(&input, &size);
+  }
+
   return rocksdb::Status::OK();
 }
 
 void Metadata::Encode(std::string *dst) {
   PutFixed8(dst, flags);
-  PutFixed32(dst, (uint32_t)expire);
+  PutExpire(dst);
   if (Type() != kRedisString) {
     PutFixed64(dst, version);
-    PutFixed32(dst, size);
+    PutFixedCommon(dst, size);
   }
 }
 
 void Metadata::InitVersionCounter() {
   // use random position for initial counter to avoid conflicts,
   // when the slave was promoted as master and the system clock may backoff
-  srand(static_cast<unsigned>(Util::GetTimeStamp()));
   version_counter_ = static_cast<uint64_t>(std::rand());
 }
 
 uint64_t Metadata::generateVersion() {
-  uint64_t version = Util::GetTimeStampUS();
+  uint64_t timestamp = util::GetTimeStampUS();
   uint64_t counter = version_counter_.fetch_add(1);
-  return (version << VersionCounterBits) + (counter % (1 << VersionCounterBits));
+  return (timestamp << VersionCounterBits) + (counter % (1 << VersionCounterBits));
 }
 
 bool Metadata::operator==(const Metadata &that) const {
@@ -217,44 +205,118 @@ bool Metadata::operator==(const Metadata &that) const {
   return true;
 }
 
-RedisType Metadata::Type() const { return static_cast<RedisType>(flags & (uint8_t)0x0f); }
+RedisType Metadata::Type() const { return static_cast<RedisType>(flags & METADATA_TYPE_MASK); }
 
-int32_t Metadata::TTL() const {
-  if (expire <= 0) {
+size_t Metadata::GetOffsetAfterExpire(uint8_t flags) {
+  if (flags & METADATA_64BIT_ENCODING_MASK) {
+    return 1 + 8;
+  }
+
+  return 1 + 4;
+}
+
+size_t Metadata::GetOffsetAfterSize(uint8_t flags) {
+  if (flags & METADATA_64BIT_ENCODING_MASK) {
+    return 1 + 8 + 8 + 8;
+  }
+
+  return 1 + 4 + 8 + 4;
+}
+
+uint64_t Metadata::ExpireMsToS(uint64_t ms) {
+  if (ms == 0) {
+    return 0;
+  }
+
+  if (ms < 1000) {
+    return 1;
+  }
+
+  // We use rounding to get closer to the original value
+  return (ms + 499) / 1000;
+}
+
+bool Metadata::Is64BitEncoded() const { return flags & METADATA_64BIT_ENCODING_MASK; }
+
+size_t Metadata::CommonEncodedSize() const { return Is64BitEncoded() ? 8 : 4; }
+
+bool Metadata::GetFixedCommon(rocksdb::Slice *input, uint64_t *value) const {
+  if (Is64BitEncoded()) {
+    return GetFixed64(input, value);
+  } else {
+    uint32_t v = 0;
+    bool res = GetFixed32(input, &v);
+    *value = v;
+    return res;
+  }
+}
+
+bool Metadata::GetExpire(rocksdb::Slice *input) {
+  uint64_t v = 0;
+
+  if (!GetFixedCommon(input, &v)) {
+    return false;
+  }
+
+  if (Is64BitEncoded()) {
+    expire = v;
+  } else {
+    expire = v * 1000;
+  }
+
+  return true;
+}
+
+void Metadata::PutFixedCommon(std::string *dst, uint64_t value) const {
+  if (Is64BitEncoded()) {
+    PutFixed64(dst, value);
+  } else {
+    PutFixed32(dst, value);
+  }
+}
+
+void Metadata::PutExpire(std::string *dst) const {
+  if (Is64BitEncoded()) {
+    PutFixed64(dst, expire);
+  } else {
+    PutFixed32(dst, ExpireMsToS(expire));
+  }
+}
+
+int64_t Metadata::TTL() const {
+  if (expire == 0) {
     return -1;
   }
-  auto now = Util::GetTimeStamp();
+
+  auto now = util::GetTimeStampMS();
   if (expire < now) {
     return -2;
   }
-  return int32_t(expire - now);
+
+  return int64_t(expire - now);
 }
 
 timeval Metadata::Time() const {
   auto t = version >> VersionCounterBits;
-  struct timeval created_at {
-    static_cast<uint32_t>(t / 1000000), static_cast<int32_t>(t % 1000000)
-  };
+  timeval created_at{static_cast<uint32_t>(t / 1000000), static_cast<int32_t>(t % 1000000)};
   return created_at;
 }
 
-bool Metadata::Expired() const {
+bool Metadata::ExpireAt(uint64_t expired_ts) const {
   if (Type() != kRedisString && Type() != kRedisStream && size == 0) {
     return true;
   }
-
-  if (expire <= 0) {
+  if (expire == 0) {
     return false;
   }
 
-  int64_t now = Util::GetTimeStamp();
-  return expire < now;
+  return expire < expired_ts;
 }
 
-ListMetadata::ListMetadata(bool generate_version) : Metadata(kRedisList, generate_version) {
-  head = UINT64_MAX / 2;
-  tail = head;
-}
+bool Metadata::Expired() const { return ExpireAt(util::GetTimeStampMS()); }
+
+ListMetadata::ListMetadata(bool generate_version)
+    : Metadata(kRedisList, generate_version), head(UINT64_MAX / 2), tail(head) {}
 
 void ListMetadata::Encode(std::string *dst) {
   Metadata::Encode(dst);
@@ -265,14 +327,14 @@ void ListMetadata::Encode(std::string *dst) {
 rocksdb::Status ListMetadata::Decode(const std::string &bytes) {
   Slice input(bytes);
   GetFixed8(&input, &flags);
-  GetFixed32(&input, reinterpret_cast<uint32_t *>(&expire));
+  GetExpire(&input);
   if (Type() != kRedisString) {
-    if (input.size() < 12) return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+    if (input.size() < 8 + CommonEncodedSize()) return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
     GetFixed64(&input, &version);
-    GetFixed32(&input, &size);
+    GetFixedCommon(&input, &size);
   }
   if (Type() == kRedisList) {
-    if (input.size() < 16) return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+    if (input.size() < 8 + 8) return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
     GetFixed64(&input, &head);
     GetFixed64(&input, &tail);
   }
@@ -301,21 +363,20 @@ void StreamMetadata::Encode(std::string *dst) {
 }
 
 rocksdb::Status StreamMetadata::Decode(const std::string &bytes) {
-  // flags(1byte) + expire (4byte)
-  if (bytes.size() < 5) {
+  Slice input(bytes);
+  if (!GetFixed8(&input, &flags)) {
+    return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+  }
+  if (!GetExpire(&input)) {
     return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
   }
 
-  Slice input(bytes);
-  GetFixed8(&input, &flags);
-  GetFixed32(&input, reinterpret_cast<uint32_t *>(&expire));
-
-  if (input.size() < 12) {
+  if (input.size() < 8 + CommonEncodedSize()) {
     return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
   }
 
   GetFixed64(&input, &version);
-  GetFixed32(&input, &size);
+  GetFixedCommon(&input, &size);
 
   if (input.size() < 88) {
     return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);

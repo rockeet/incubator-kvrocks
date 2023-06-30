@@ -18,8 +18,6 @@
  *
  */
 
-#include "config.h"
-
 #include <gtest/gtest.h>
 
 #include <fstream>
@@ -27,7 +25,7 @@
 #include <map>
 #include <vector>
 
-#include "commands/redis_cmd.h"
+#include "commands/commander.h"
 #include "config/config_util.h"
 #include "server/server.h"
 
@@ -35,7 +33,8 @@ TEST(Config, GetAndSet) {
   const char *path = "test.conf";
   Config config;
 
-  config.Load(CLIOptions(path));
+  auto s = config.Load(CLIOptions(path));
+  EXPECT_FALSE(s.IsOK());
   std::map<std::string, std::string> mutable_cases = {
       {"timeout", "1000"},
       {"maxclients", "2000"},
@@ -64,7 +63,7 @@ TEST(Config, GetAndSet) {
       {"rocksdb.write_buffer_size", "1234"},
       {"rocksdb.max_write_buffer_number", "1"},
       {"rocksdb.target_file_size_base", "100"},
-      {"rocksdb.max_background_compactions", "2"},
+      {"rocksdb.max_background_compactions", "-1"},
       {"rocksdb.max_sub_compactions", "3"},
       {"rocksdb.delayed_write_rate", "1234"},
       {"rocksdb.stats_dump_period_sec", "600"},
@@ -79,10 +78,11 @@ TEST(Config, GetAndSet) {
       {"rocksdb.max_bytes_for_level_base", "268435456"},
       {"rocksdb.max_bytes_for_level_multiplier", "10"},
       {"rocksdb.level_compaction_dynamic_level_bytes", "yes"},
+      {"rocksdb.max_background_jobs", "4"},
   };
   std::vector<std::string> values;
   for (const auto &iter : mutable_cases) {
-    auto s = config.Set(nullptr, iter.first, iter.second);
+    s = config.Set(nullptr, iter.first, iter.second);
     ASSERT_TRUE(s.IsOK());
     config.Get(iter.first, &values);
     ASSERT_TRUE(s.IsOK());
@@ -91,9 +91,10 @@ TEST(Config, GetAndSet) {
     EXPECT_EQ(values[1], iter.second);
   }
   ASSERT_TRUE(config.Rewrite().IsOK());
-  config.Load(CLIOptions(path));
+  s = config.Load(CLIOptions(path));
+  EXPECT_TRUE(s.IsOK());
   for (const auto &iter : mutable_cases) {
-    auto s = config.Set(nullptr, iter.first, iter.second);
+    s = config.Set(nullptr, iter.first, iter.second);
     ASSERT_TRUE(s.IsOK());
     config.Get(iter.first, &values);
     ASSERT_EQ(values.size(), 2);
@@ -115,7 +116,7 @@ TEST(Config, GetAndSet) {
       {"pidfile", "test.pid"},
       {"supervised", "no"},
       {"rocksdb.block_size", "1234"},
-      {"rocksdb.max_background_flushes", "16"},
+      {"rocksdb.max_background_flushes", "-1"},
       {"rocksdb.wal_ttl_seconds", "10000"},
       {"rocksdb.wal_size_limit_mb", "16"},
       {"rocksdb.enable_pipelined_write", "no"},
@@ -123,9 +124,10 @@ TEST(Config, GetAndSet) {
       {"rocksdb.metadata_block_cache_size", "100"},
       {"rocksdb.subkey_block_cache_size", "100"},
       {"rocksdb.row_cache_size", "100"},
+      {"rocksdb.rate_limiter_auto_tuned", "yes"},
   };
   for (const auto &iter : immutable_cases) {
-    auto s = config.Set(nullptr, iter.first, iter.second);
+    s = config.Set(nullptr, iter.first, iter.second);
     ASSERT_FALSE(s.IsOK());
   }
 }
@@ -142,7 +144,7 @@ TEST(Config, GetRenameCommand) {
   output_file << "rename-command SET SET_NEW"
               << "\n";
   output_file.close();
-  Redis::ResetCommands();
+  redis::ResetCommands();
   Config config;
   ASSERT_TRUE(config.Load(CLIOptions(path)).IsOK());
   std::vector<std::string> values;
@@ -168,12 +170,12 @@ TEST(Config, Rewrite) {
               << "\n";
   output_file.close();
 
-  Redis::ResetCommands();
+  redis::ResetCommands();
   Config config;
   ASSERT_TRUE(config.Load(CLIOptions(path)).IsOK());
   ASSERT_TRUE(config.Rewrite().IsOK());
   // Need to re-populate the command table since it has renamed by the previous
-  Redis::ResetCommands();
+  redis::ResetCommands();
   Config new_config;
   ASSERT_TRUE(new_config.Load(CLIOptions(path)).IsOK());
   unlink(path);
@@ -184,7 +186,8 @@ TEST(Namespace, Add) {
   unlink(path);
 
   Config config;
-  config.Load(CLIOptions(path));
+  auto s = config.Load(CLIOptions(path));
+  EXPECT_FALSE(s.IsOK());
   config.slot_id_encoded = false;
   EXPECT_TRUE(!config.AddNamespace("ns", "t0").IsOK());
   config.requirepass = "foobared";
@@ -196,15 +199,16 @@ TEST(Namespace, Add) {
   }
   for (size_t i = 0; i < namespaces.size(); i++) {
     std::string token;
-    config.GetNamespace(namespaces[i], &token);
+    s = config.GetNamespace(namespaces[i], &token);
+    EXPECT_TRUE(s.IsOK());
     EXPECT_EQ(token, tokens[i]);
   }
   for (size_t i = 0; i < namespaces.size(); i++) {
-    auto s = config.AddNamespace(namespaces[i], tokens[i]);
+    s = config.AddNamespace(namespaces[i], tokens[i]);
     EXPECT_FALSE(s.IsOK());
     EXPECT_EQ(s.Msg(), "the token has already exists");
   }
-  auto s = config.AddNamespace("n1", "t0");
+  s = config.AddNamespace("n1", "t0");
   EXPECT_FALSE(s.IsOK());
   EXPECT_EQ(s.Msg(), "the namespace has already exists");
 
@@ -219,14 +223,15 @@ TEST(Namespace, Set) {
   unlink(path);
 
   Config config;
-  config.Load(CLIOptions(path));
+  auto s = config.Load(CLIOptions(path));
+  EXPECT_FALSE(s.IsOK());
   config.slot_id_encoded = false;
   config.requirepass = "foobared";
   std::vector<std::string> namespaces = {"n1", "n2", "n3", "n4"};
   std::vector<std::string> tokens = {"t1", "t2", "t3", "t4"};
   std::vector<std::string> new_tokens = {"nt1", "nt2'", "nt3", "nt4"};
   for (size_t i = 0; i < namespaces.size(); i++) {
-    auto s = config.SetNamespace(namespaces[i], tokens[i]);
+    s = config.SetNamespace(namespaces[i], tokens[i]);
     EXPECT_FALSE(s.IsOK());
     EXPECT_EQ(s.Msg(), "the namespace was not found");
   }
@@ -235,7 +240,8 @@ TEST(Namespace, Set) {
   }
   for (size_t i = 0; i < namespaces.size(); i++) {
     std::string token;
-    config.GetNamespace(namespaces[i], &token);
+    s = config.GetNamespace(namespaces[i], &token);
+    EXPECT_TRUE(s.IsOK());
     EXPECT_EQ(token, tokens[i]);
   }
   for (size_t i = 0; i < namespaces.size(); i++) {
@@ -243,7 +249,8 @@ TEST(Namespace, Set) {
   }
   for (size_t i = 0; i < namespaces.size(); i++) {
     std::string token;
-    config.GetNamespace(namespaces[i], &token);
+    s = config.GetNamespace(namespaces[i], &token);
+    EXPECT_TRUE(s.IsOK());
     EXPECT_EQ(token, new_tokens[i]);
   }
   unlink(path);
@@ -254,7 +261,8 @@ TEST(Namespace, Delete) {
   unlink(path);
 
   Config config;
-  config.Load(CLIOptions(path));
+  auto s = config.Load(CLIOptions(path));
+  EXPECT_FALSE(s.IsOK());
   config.slot_id_encoded = false;
   config.requirepass = "foobared";
   std::vector<std::string> namespaces = {"n1", "n2", "n3", "n4"};
@@ -264,13 +272,16 @@ TEST(Namespace, Delete) {
   }
   for (size_t i = 0; i < namespaces.size(); i++) {
     std::string token;
-    config.GetNamespace(namespaces[i], &token);
+    s = config.GetNamespace(namespaces[i], &token);
+    EXPECT_TRUE(s.IsOK());
     EXPECT_EQ(token, tokens[i]);
   }
   for (const auto &ns : namespaces) {
-    config.DelNamespace(ns);
+    s = config.DelNamespace(ns);
+    EXPECT_TRUE(s.IsOK());
     std::string token;
-    config.GetNamespace(ns, &token);
+    s = config.GetNamespace(ns, &token);
+    EXPECT_FALSE(s.IsOK());
     EXPECT_TRUE(token.empty());
   }
   unlink(path);
@@ -280,7 +291,8 @@ TEST(Namespace, RewriteNamespaces) {
   const char *path = "test.conf";
   unlink(path);
   Config config;
-  config.Load(CLIOptions(path));
+  auto s = config.Load(CLIOptions(path));
+  EXPECT_FALSE(s.IsOK());
   config.requirepass = "test";
   config.backup_dir = "test";
   config.slot_id_encoded = false;
@@ -293,10 +305,12 @@ TEST(Namespace, RewriteNamespaces) {
   EXPECT_TRUE(config.DelNamespace("to-be-deleted-ns").IsOK());
 
   Config new_config;
-  auto s = new_config.Load(CLIOptions(path));
+  s = new_config.Load(CLIOptions(path));
+  EXPECT_TRUE(s.IsOK());
   for (size_t i = 0; i < namespaces.size(); i++) {
     std::string token;
-    new_config.GetNamespace(namespaces[i], &token);
+    s = new_config.GetNamespace(namespaces[i], &token);
+    EXPECT_TRUE(s.IsOK());
     EXPECT_EQ(token, tokens[i]);
   }
 

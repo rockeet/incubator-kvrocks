@@ -26,14 +26,15 @@
 
 #include "status.h"
 
-namespace Kvrocks2redis {
+namespace kvrocks2redis {
 
-struct redis_server {
+struct RedisServer {
   std::string host;
   uint32_t port;
   std::string auth;
   int db_number;
 };
+
 struct Config {
  public:
   int loglevel = 0;
@@ -50,18 +51,17 @@ struct Config {
   std::string kvrocks_auth;
   std::string kvrocks_host;
   int kvrocks_port = 0;
-  std::map<std::string, redis_server> tokens;
+  std::map<std::string, RedisServer> tokens;
   bool cluster_enable = false;
 
- public:
   Status Load(std::string path);
   Config() = default;
   ~Config() = default;
 
  private:
   std::string path_;
-  int yesnotoi(std::string input);
-  Status parseConfigFromString(std::string input);
+  static StatusOr<bool> yesnotoi(const std::string &input);
+  Status parseConfigFromString(const std::string &input);
 };
 
-}  // namespace Kvrocks2redis
+}  // namespace kvrocks2redis
